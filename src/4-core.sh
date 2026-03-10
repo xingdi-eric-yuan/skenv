@@ -68,66 +68,76 @@ _resolve_env_chain() {
 _sync_skills() {
     # Clean wipe-and-replace: true venv-style isolation.
     # Layering: base -> parent envs (if inherited) -> active env.
+    # Now targets a single platform dir based on env's platform.
     local env_name="$1"
+
+    local platform
+    platform=$(_platform_for_env "$env_name")
+    local skills_dir
+    skills_dir=$(_skills_dir_for_platform "$platform")
 
     local chain_str
     chain_str=$(_resolve_env_chain "$env_name")
     local -a chain=()
     IFS='|' read -ra chain <<< "$chain_str"
 
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
-        mkdir -p "$skills_dir"
-        _wipe_skills_dir "$skills_dir"
+    mkdir -p "$skills_dir"
+    _wipe_skills_dir "$skills_dir"
 
-        # Base layer (always present)
-        if [[ -d "$BASE_DIR" ]]; then
-            _link_skills_from "$BASE_DIR" "$skills_dir"
+    # Base layer (always present)
+    if [[ -d "$BASE_DIR" ]]; then
+        _link_skills_from "$BASE_DIR" "$skills_dir"
+    fi
+
+    # Inheritance chain (parent first, child last = child wins)
+    for link_env in "${chain[@]}"; do
+        local link_dir
+        link_dir=$(_env_dir "$link_env")
+        if [[ -d "$link_dir" ]]; then
+            _link_skills_from "$link_dir" "$skills_dir"
         fi
-
-        # Inheritance chain (parent first, child last = child wins)
-        for link_env in "${chain[@]}"; do
-            local link_dir
-            link_dir=$(_env_dir "$link_env")
-            if [[ -d "$link_dir" ]]; then
-                _link_skills_from "$link_dir" "$skills_dir"
-            fi
-        done
     done
 }
 
 _auto_import() {
     local skip_confirm="${1:-0}"
     local target_env="${2:-}"
-    # On first use, snapshot existing skills into _pre-skenv.
+    # On first use per platform, snapshot existing skills into _pre-skenv-<platform>.
     # Preserves symlinks as symlinks so external references stay linked.
+
+    local platform="$PLATFORM_CLAUDE"
+    if [[ -n "$target_env" ]]; then
+        platform=$(_platform_for_env "$target_env")
+    fi
+
+    local pre_name
+    pre_name=$(_pre_skenv_for_platform "$platform")
     local pre_dir
-    pre_dir=$(_env_dir "$PRE_SKENV")
+    pre_dir=$(_env_dir "$pre_name")
     [[ -d "$pre_dir" ]] && return 0
+
+    local skills_dir
+    skills_dir=$(_skills_dir_for_platform "$platform")
 
     # Check if there are existing skills to protect
     local has_skills=0
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
-        if [[ -d "$skills_dir" ]] && [[ -n "$(ls -A "$skills_dir" 2>/dev/null)" ]]; then
-            has_skills=1
-            break
-        fi
-    done
+    if [[ -d "$skills_dir" ]] && [[ -n "$(ls -A "$skills_dir" 2>/dev/null)" ]]; then
+        has_skills=1
+    fi
 
     if [[ $has_skills -eq 1 ]] && [[ "$skip_confirm" -ne 1 ]] && [[ "${SKENV_YES:-}" != "1" ]]; then
         echo ""
-        _warn "${BOLD}First-time setup — please read carefully.${NC}"
+        _warn "${BOLD}First-time setup for $platform — please read carefully.${NC}"
         echo ""
-        echo -e "  skenv will manage these skill directories:"
-        for skills_dir in "${SKILLS_DIRS[@]}"; do
-            local count=0
-            [[ -d "$skills_dir" ]] && count=$(find "$skills_dir" -maxdepth 1 -mindepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')
-            echo -e "    ${CYAN}$skills_dir${NC}  ($count skills)"
-        done
+        echo -e "  skenv will manage this skill directory:"
+        local count=0
+        [[ -d "$skills_dir" ]] && count=$(find "$skills_dir" -maxdepth 1 -mindepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')
+        echo -e "    ${CYAN}$skills_dir${NC}  ($count skills)"
         echo ""
-        echo -e "  On activate, skenv ${RED}replaces all contents${NC} of these directories"
+        echo -e "  On activate, skenv ${RED}replaces all contents${NC} of this directory"
         echo -e "  with symlinks to the active environment."
         echo ""
-        echo -e "  skenv will snapshot your current skills into a ${BOLD}_pre-skenv${NC} environment,"
+        echo -e "  skenv will snapshot your current skills into a ${BOLD}$pre_name${NC} environment,"
         echo -e "  but we strongly recommend you back them up yourself first."
         echo ""
         echo -n -e "  ${BOLD}Have you backed up your skills? [y/N]${NC} "
@@ -139,7 +149,7 @@ _auto_import() {
                 ;;
             *)
                 _error "Aborting. Please back up your skills first, then try again."
-                _hint "Example: cp -r ~/.claude/skills ~/skills-backup"
+                _hint "Example: cp -r $skills_dir ~/skills-backup-$platform"
                 exit 1
                 ;;
         esac
@@ -147,9 +157,10 @@ _auto_import() {
 
     local imported=0
     mkdir -p "$pre_dir"
+    # Tag the backup env with its platform
+    echo "$platform" > "$pre_dir/.platform"
 
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
-        [[ -d "$skills_dir" ]] || continue
+    if [[ -d "$skills_dir" ]]; then
         for item in "$skills_dir"/*; do
             [[ -e "$item" || -L "$item" ]] || continue
             local name
@@ -169,14 +180,14 @@ _auto_import() {
             fi
             imported=$((imported + 1))
         done
-    done
+    fi
 
     if [[ $imported -gt 0 ]]; then
-        _info "Imported $imported existing skill(s) into ${BOLD}$PRE_SKENV${NC} environment."
-        _hint "Run 'skenv activate $PRE_SKENV' anytime to restore your original skills."
+        _info "Imported $imported existing $platform skill(s) into ${BOLD}$pre_name${NC} environment."
+        _hint "Run 'skenv activate $pre_name' anytime to restore your original $platform skills."
 
         # Offer to copy existing skills into the target environment
-        if [[ -n "$target_env" ]] && [[ "$target_env" != "$PRE_SKENV" ]]; then
+        if [[ -n "$target_env" ]] && [[ "$target_env" != "$pre_name" ]]; then
             local target_dir
             target_dir=$(_env_dir "$target_env")
             local do_import=0

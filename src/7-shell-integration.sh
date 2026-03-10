@@ -14,8 +14,15 @@ _skenv_auto_activate() {
         if [[ -f "$dir/.skenv" ]]; then
             local env_name
             env_name=$(cat "$dir/.skenv" | tr -d '[:space:]')
+            local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
+            # Read env's platform
+            local platform="claude"
+            if [[ -f "$skenv_home/$env_name/.platform" ]]; then
+                platform=$(cat "$skenv_home/$env_name/.platform")
+            fi
+            local active_file="$skenv_home/.active-$platform"
             local current=""
-            [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && current=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+            [[ -f "$active_file" ]] && current=$(cat "$active_file")
             if [[ -n "$env_name" && "$env_name" != "$current" ]]; then
                 # Don't retry a failed activation
                 if [[ "${_skenv_last_failed:-}" == "$env_name" ]]; then
@@ -35,10 +42,24 @@ _skenv_auto_activate() {
 }
 
 _skenv_prompt() {
-    local active=""
-    [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && active=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
-    if [[ -n "$active" ]]; then
-        echo "[skenv:${active}] "
+    local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
+    local parts=""
+    for p in claude copilot; do
+        local af="$skenv_home/.active-$p"
+        if [[ -f "$af" ]]; then
+            local val
+            val=$(cat "$af")
+            if [[ -n "$val" ]]; then
+                if [[ -n "$parts" ]]; then
+                    parts="$parts $p:$val"
+                else
+                    parts="$p:$val"
+                fi
+            fi
+        fi
+    done
+    if [[ -n "$parts" ]]; then
+        echo "[skenv:${parts}] "
     fi
 }
 
@@ -87,19 +108,28 @@ _skenv_completions() {
             ;;
         activate|delete|ls|inherit|run)
             local envs=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/" 2>/dev/null | grep -v '^\.')
-            COMPREPLY=($(compgen -W "$envs" -- "$cur"))
+            COMPREPLY=($(compgen -W "$envs --claude --copilot" -- "$cur"))
             ;;
         clone|diff)
             local envs=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/" 2>/dev/null | grep -v '^\.')
             COMPREPLY=($(compgen -W "$envs" -- "$cur"))
             ;;
         uninstall)
+            local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
             local active=""
-            [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && active=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+            for p in claude copilot; do
+                [[ -f "$skenv_home/.active-$p" ]] && active=$(cat "$skenv_home/.active-$p") && break
+            done
             if [[ -n "$active" ]]; then
-                local skills=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/$active/" 2>/dev/null)
+                local skills=$(ls -1 "$skenv_home/$active/" 2>/dev/null)
                 COMPREPLY=($(compgen -W "$skills" -- "$cur"))
             fi
+            ;;
+        create)
+            COMPREPLY=($(compgen -W "--claude --copilot --from" -- "$cur"))
+            ;;
+        deactivate)
+            COMPREPLY=($(compgen -W "--claude --copilot" -- "$cur"))
             ;;
         base)
             COMPREPLY=($(compgen -W "install uninstall ls" -- "$cur"))
@@ -156,6 +186,10 @@ _skenv() {
     elif (( CURRENT >= 3 )); then
         local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
         case "${words[2]}" in
+            create)
+                local -a flags=('--claude' '--copilot' '--from')
+                _describe 'flag' flags
+                ;;
             activate|delete|ls|inherit|run|diff)
                 envs=($(ls -1 "$skenv_home/" 2>/dev/null | grep -v '^\.'))
                 _describe 'environment' envs
@@ -164,9 +198,15 @@ _skenv() {
                 envs=($(ls -1 "$skenv_home/" 2>/dev/null | grep -v '^\.'))
                 _describe 'environment' envs
                 ;;
+            deactivate)
+                local -a flags=('--claude' '--copilot')
+                _describe 'flag' flags
+                ;;
             uninstall)
                 local active=""
-                [[ -f "$skenv_home/.active" ]] && active=$(cat "$skenv_home/.active")
+                for p in claude copilot; do
+                    [[ -f "$skenv_home/.active-$p" ]] && active=$(cat "$skenv_home/.active-$p") && break
+                done
                 if [[ -n "$active" ]]; then
                     skills=($(ls -1 "$skenv_home/$active/" 2>/dev/null))
                     _describe 'skill' skills

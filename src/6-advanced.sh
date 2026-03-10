@@ -41,12 +41,15 @@ cmd_base() {
             fi
             _info "Installed ${BOLD}$skill_name${NC} into ${BOLD}base layer${NC}"
 
-            local current
-            current=$(_get_active)
-            if [[ -n "$current" ]]; then
-                _sync_skills "$current"
-                _hint "Active environment updated."
-            fi
+            # Re-sync all active environments (base is universal)
+            for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+                local current
+                current=$(_get_active "$p")
+                if [[ -n "$current" ]]; then
+                    _sync_skills "$current"
+                fi
+            done
+            _hint "Active environment(s) updated."
             ;;
         uninstall)
             local skill_name="${1:?Usage: skenv base uninstall <skill-name>}"
@@ -58,12 +61,15 @@ cmd_base() {
             rm -rf "$target"
             _info "Uninstalled ${BOLD}$skill_name${NC} from ${BOLD}base layer${NC}"
 
-            local current
-            current=$(_get_active)
-            if [[ -n "$current" ]]; then
-                _sync_skills "$current"
-                _hint "Active environment updated."
-            fi
+            # Re-sync all active environments (base is universal)
+            for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+                local current
+                current=$(_get_active "$p")
+                if [[ -n "$current" ]]; then
+                    _sync_skills "$current"
+                fi
+            done
+            _hint "Active environment(s) updated."
             ;;
         ls)
             echo -e "${BOLD}Base layer skills (always active):${NC}"
@@ -165,6 +171,7 @@ cmd_freeze() {
 
     echo "# skenv manifest for: $env_name"
     echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# Platform: $(_platform_for_env "$env_name")"
     echo ""
 
     for skill in "$env_dir"/*; do
@@ -196,13 +203,16 @@ cmd_freeze() {
 }
 
 cmd_init() {
-    local name="${1:?Usage: skenv init <name> --from <manifest>}"
+    local name="${1:?Usage: skenv init <name> --from <manifest> [--claude|--copilot]}"
     shift
 
     local manifest=""
+    local platform=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) manifest="$2"; shift 2 ;;
+            --claude) platform="$PLATFORM_CLAUDE"; shift ;;
+            --copilot) platform="$PLATFORM_COPILOT"; shift ;;
             *) _error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -218,7 +228,19 @@ cmd_init() {
         exit 1
     fi
 
-    cmd_create "$name"
+    # Read platform from manifest if not specified via flag
+    if [[ -z "$platform" ]]; then
+        platform=$(grep '^# Platform:' "$manifest" 2>/dev/null | sed 's/^# Platform: *//' | head -1)
+    fi
+
+    # Create env with correct platform flag
+    local create_args=("$name")
+    if [[ "$platform" == "$PLATFORM_COPILOT" ]]; then
+        create_args+=("--copilot")
+    elif [[ -n "$platform" ]]; then
+        create_args+=("--claude")
+    fi
+    cmd_create "${create_args[@]}"
 
     local env_dir
     env_dir=$(_env_dir "$name")
@@ -273,6 +295,15 @@ cmd_inherit() {
         exit 1
     fi
 
+    # Enforce same platform
+    local child_platform parent_platform
+    child_platform=$(_platform_for_env "$child")
+    parent_platform=$(_platform_for_env "$parent")
+    if [[ "$child_platform" != "$parent_platform" ]]; then
+        _error "Cannot inherit across platforms: '$child' is $child_platform, '$parent' is $parent_platform."
+        exit 1
+    fi
+
     # Validate no cycles BEFORE writing .parent
     local parent_file="$(_env_dir "$child")/.parent"
     local old_parent=""
@@ -295,7 +326,7 @@ cmd_inherit() {
     _info "${BOLD}$child${NC} now inherits from ${BOLD}$parent${NC}"
 
     local current
-    current=$(_get_active)
+    current=$(_get_active "$child_platform")
     if [[ "$current" == "$child" ]]; then
         _sync_skills "$child"
         _hint "Active environment updated."
@@ -321,26 +352,30 @@ cmd_run() {
         exit 1
     fi
 
-    local previous
-    previous=$(_get_active)
+    local platform
+    platform=$(_platform_for_env "$env_name")
+    local active_file
+    active_file=$(_active_file_for_platform "$platform")
+    local previous=""
+    [[ -f "$active_file" ]] && previous=$(cat "$active_file")
 
     _ensure_home
 
     # Trap to restore state on signals
     _cmd_run_restore() {
         if [[ -n "$previous" ]]; then
-            echo "$previous" > "$ACTIVE_FILE"
+            echo "$previous" > "$active_file"
             _sync_skills "$previous"
         else
-            rm -f "$ACTIVE_FILE"
-            for skills_dir in "${SKILLS_DIRS[@]}"; do
-                _wipe_skills_dir "$skills_dir"
-            done
+            rm -f "$active_file"
+            local sd
+            sd=$(_skills_dir_for_platform "$platform")
+            _wipe_skills_dir "$sd"
         fi
     }
     trap _cmd_run_restore EXIT
 
-    echo "$env_name" > "$ACTIVE_FILE"
+    echo "$env_name" > "$active_file"
     _sync_skills "$env_name"
 
     local exit_code=0

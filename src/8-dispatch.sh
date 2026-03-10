@@ -8,26 +8,35 @@ USAGE:
   skenv <command> [arguments]
 
 COMMANDS:
-  create <name> [--from <env>] Create a new skill environment (optionally from existing)
-  activate [-y] <name>      Activate env (clean swap into ~/.claude/skills/ & ~/.copilot/skills/)
-  deactivate                 Deactivate (removes all skills from discovery dirs)
-  install <path> [opts]      Install a skill (--env N, --link)
-  uninstall <name> [opts]    Remove a skill (--env N)
-  list                       List all environments (* = active)
-  ls [name]                  List skills in an environment (default: active)
-  status                     Show current active environment
-  clone <src> <dst>          Clone an environment
-  delete <name>              Delete an environment
-  base install|uninstall|ls  Manage base layer (always-on skills)
-  diff <env-a> <env-b>       Compare two environments
-  freeze [name]              Export env as manifest (pipe to file)
-  init <name> --from <file>  Recreate env from manifest
-  inherit <child> <parent>   Set env inheritance
-  run <env> -- <cmd...>      Run command with temporary env
-  registry add|remove|list   Manage skill registry
-  hook [bash|zsh]            Print shell hook (auto-activate + prompt)
-  completion [bash|zsh]      Print tab completion script
-  help                       Show this help
+  create <name> [opts]         Create a new skill environment
+                               --claude (default) or --copilot to set platform
+                               --from <env> to copy from existing env
+  activate [-y] <name>         Activate env (symlinks into platform's skills dir)
+  deactivate [--claude|--copilot]  Deactivate env(s) (no flag = deactivate all)
+  install <path> [opts]        Install a skill (--env N, --link)
+  uninstall <name> [opts]      Remove a skill (--env N)
+  list                         List all environments (* = active, shows platform)
+  ls [name]                    List skills in an environment (default: active)
+  status                       Show active environment(s) per platform
+  clone <src> <dst>            Clone an environment (preserves platform)
+  delete <name>                Delete an environment
+  base install|uninstall|ls    Manage base layer (always-on skills, all platforms)
+  diff <env-a> <env-b>         Compare two environments
+  freeze [name]                Export env as manifest (pipe to file)
+  init <name> --from <file>    Recreate env from manifest (--claude|--copilot)
+  inherit <child> <parent>     Set env inheritance (same platform only)
+  run <env> -- <cmd...>        Run command with temporary env
+  registry add|remove|list     Manage skill registry
+  hook [bash|zsh]              Print shell hook (auto-activate + prompt)
+  completion [bash|zsh]        Print tab completion script
+  help                         Show this help
+
+PLATFORMS:
+  Each environment targets exactly one platform:
+    --claude   → manages ~/.claude/skills/   (default)
+    --copilot  → manages ~/.copilot/skills/
+
+  You can have one active env per platform simultaneously.
 
 ENVIRONMENT VARIABLES:
   SKENV_HOME            Base directory for envs (default: ~/.skenv)
@@ -38,25 +47,25 @@ SETUP:
   eval "$(skenv completion zsh)"      # tab completion
 
 EXAMPLES:
-  skenv create research
-  skenv activate research
-  skenv install ~/my-skills/zsh-shell
+  skenv create research                   # claude env (default)
+  skenv create copilot-dev --copilot      # copilot env
+  skenv activate research                 # activates in ~/.claude/skills/
+  skenv activate copilot-dev              # activates in ~/.copilot/skills/
+  skenv status                            # shows both active envs
+
   skenv install ~/my-skills/python-research --link
   skenv base install ~/my-skills/always-on-skill
   skenv ls
 
-  skenv create webdev
-  skenv activate webdev               # clean switch — only webdev skills
-  skenv install react-patterns        # install from registry
+  skenv deactivate --claude               # deactivate only claude
+  skenv deactivate                        # deactivate all
 
-  skenv freeze > research.manifest    # export
+  skenv freeze > research.manifest        # export (includes platform)
   skenv init research-v2 --from research.manifest  # recreate
 
-  skenv inherit research-v2 research  # research-v2 extends research
-  skenv run research -- claude        # temporary activation
-
-  skenv list                          # shows all envs, * marks active
-  skenv diff research webdev          # compare two envs
+  skenv inherit research-v2 research      # must be same platform
+  skenv run research -- claude            # temporary activation
+  skenv diff research webdev              # compare two envs
 EOF
 }
 

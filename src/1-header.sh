@@ -12,16 +12,13 @@ set -euo pipefail
 # --- Configuration ---
 
 SKENV_HOME="${SKENV_HOME:-$HOME/.skenv}"
-ACTIVE_FILE="$SKENV_HOME/.active"
 BASE_DIR="$SKENV_HOME/.base"
 REGISTRY_FILE="$SKENV_HOME/.registry"
-PRE_SKENV="_pre-skenv"
 
-# Skill directories to sync — supports both Claude Code and Copilot CLI
-SKILLS_DIRS=(
-    "$HOME/.claude/skills"
-    "$HOME/.copilot/skills"
-)
+# Valid platforms and their skills directories
+PLATFORM_CLAUDE="claude"
+PLATFORM_COPILOT="copilot"
+DEFAULT_PLATFORM="$PLATFORM_CLAUDE"
 
 # --- Colors ---
 

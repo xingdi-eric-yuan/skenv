@@ -12,16 +12,13 @@ set -euo pipefail
 # --- Configuration ---
 
 SKENV_HOME="${SKENV_HOME:-$HOME/.skenv}"
-ACTIVE_FILE="$SKENV_HOME/.active"
 BASE_DIR="$SKENV_HOME/.base"
 REGISTRY_FILE="$SKENV_HOME/.registry"
-PRE_SKENV="_pre-skenv"
 
-# Skill directories to sync — supports both Claude Code and Copilot CLI
-SKILLS_DIRS=(
-    "$HOME/.claude/skills"
-    "$HOME/.copilot/skills"
-)
+# Valid platforms and their skills directories
+PLATFORM_CLAUDE="claude"
+PLATFORM_COPILOT="copilot"
+DEFAULT_PLATFORM="$PLATFORM_CLAUDE"
 
 # --- Colors ---
 
@@ -46,19 +43,72 @@ _ensure_home() {
     mkdir -p "$SKENV_HOME"
 }
 
-_get_active() {
-    if [[ -f "$ACTIVE_FILE" ]]; then
-        cat "$ACTIVE_FILE"
+_skills_dir_for_platform() {
+    local platform="$1"
+    case "$platform" in
+        claude)  echo "$HOME/.claude/skills" ;;
+        copilot) echo "$HOME/.copilot/skills" ;;
+        *) _error "Unknown platform: $platform"; exit 1 ;;
+    esac
+}
+
+_active_file_for_platform() {
+    echo "$SKENV_HOME/.active-$1"
+}
+
+_pre_skenv_for_platform() {
+    echo "_pre-skenv-$1"
+}
+
+_platform_for_env() {
+    local env_name="$1"
+    local pfile="$(_env_dir "$env_name")/.platform"
+    if [[ -f "$pfile" ]]; then
+        cat "$pfile"
     else
+        echo "$DEFAULT_PLATFORM"
+    fi
+}
+
+_get_active() {
+    # With arg: return active env for that platform
+    # Without arg: return first active env found (claude then copilot)
+    local platform="${1:-}"
+    if [[ -n "$platform" ]]; then
+        local af
+        af=$(_active_file_for_platform "$platform")
+        if [[ -f "$af" ]]; then
+            cat "$af"
+        else
+            echo ""
+        fi
+    else
+        for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+            local af
+            af=$(_active_file_for_platform "$p")
+            if [[ -f "$af" ]]; then
+                local val
+                val=$(cat "$af")
+                if [[ -n "$val" ]]; then
+                    echo "$val"
+                    return 0
+                fi
+            fi
+        done
         echo ""
     fi
 }
 
 _require_active() {
+    local platform="${1:-}"
     local active
-    active=$(_get_active)
+    active=$(_get_active "$platform")
     if [[ -z "$active" ]]; then
-        _error "No active skill environment."
+        if [[ -n "$platform" ]]; then
+            _error "No active $platform skill environment."
+        else
+            _error "No active skill environment."
+        fi
         _hint "Run: skenv activate <name>"
         exit 1
     fi
@@ -217,66 +267,76 @@ _resolve_env_chain() {
 _sync_skills() {
     # Clean wipe-and-replace: true venv-style isolation.
     # Layering: base -> parent envs (if inherited) -> active env.
+    # Now targets a single platform dir based on env's platform.
     local env_name="$1"
+
+    local platform
+    platform=$(_platform_for_env "$env_name")
+    local skills_dir
+    skills_dir=$(_skills_dir_for_platform "$platform")
 
     local chain_str
     chain_str=$(_resolve_env_chain "$env_name")
     local -a chain=()
     IFS='|' read -ra chain <<< "$chain_str"
 
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
-        mkdir -p "$skills_dir"
-        _wipe_skills_dir "$skills_dir"
+    mkdir -p "$skills_dir"
+    _wipe_skills_dir "$skills_dir"
 
-        # Base layer (always present)
-        if [[ -d "$BASE_DIR" ]]; then
-            _link_skills_from "$BASE_DIR" "$skills_dir"
+    # Base layer (always present)
+    if [[ -d "$BASE_DIR" ]]; then
+        _link_skills_from "$BASE_DIR" "$skills_dir"
+    fi
+
+    # Inheritance chain (parent first, child last = child wins)
+    for link_env in "${chain[@]}"; do
+        local link_dir
+        link_dir=$(_env_dir "$link_env")
+        if [[ -d "$link_dir" ]]; then
+            _link_skills_from "$link_dir" "$skills_dir"
         fi
-
-        # Inheritance chain (parent first, child last = child wins)
-        for link_env in "${chain[@]}"; do
-            local link_dir
-            link_dir=$(_env_dir "$link_env")
-            if [[ -d "$link_dir" ]]; then
-                _link_skills_from "$link_dir" "$skills_dir"
-            fi
-        done
     done
 }
 
 _auto_import() {
     local skip_confirm="${1:-0}"
     local target_env="${2:-}"
-    # On first use, snapshot existing skills into _pre-skenv.
+    # On first use per platform, snapshot existing skills into _pre-skenv-<platform>.
     # Preserves symlinks as symlinks so external references stay linked.
+
+    local platform="$PLATFORM_CLAUDE"
+    if [[ -n "$target_env" ]]; then
+        platform=$(_platform_for_env "$target_env")
+    fi
+
+    local pre_name
+    pre_name=$(_pre_skenv_for_platform "$platform")
     local pre_dir
-    pre_dir=$(_env_dir "$PRE_SKENV")
+    pre_dir=$(_env_dir "$pre_name")
     [[ -d "$pre_dir" ]] && return 0
+
+    local skills_dir
+    skills_dir=$(_skills_dir_for_platform "$platform")
 
     # Check if there are existing skills to protect
     local has_skills=0
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
-        if [[ -d "$skills_dir" ]] && [[ -n "$(ls -A "$skills_dir" 2>/dev/null)" ]]; then
-            has_skills=1
-            break
-        fi
-    done
+    if [[ -d "$skills_dir" ]] && [[ -n "$(ls -A "$skills_dir" 2>/dev/null)" ]]; then
+        has_skills=1
+    fi
 
     if [[ $has_skills -eq 1 ]] && [[ "$skip_confirm" -ne 1 ]] && [[ "${SKENV_YES:-}" != "1" ]]; then
         echo ""
-        _warn "${BOLD}First-time setup — please read carefully.${NC}"
+        _warn "${BOLD}First-time setup for $platform — please read carefully.${NC}"
         echo ""
-        echo -e "  skenv will manage these skill directories:"
-        for skills_dir in "${SKILLS_DIRS[@]}"; do
-            local count=0
-            [[ -d "$skills_dir" ]] && count=$(find "$skills_dir" -maxdepth 1 -mindepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')
-            echo -e "    ${CYAN}$skills_dir${NC}  ($count skills)"
-        done
+        echo -e "  skenv will manage this skill directory:"
+        local count=0
+        [[ -d "$skills_dir" ]] && count=$(find "$skills_dir" -maxdepth 1 -mindepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')
+        echo -e "    ${CYAN}$skills_dir${NC}  ($count skills)"
         echo ""
-        echo -e "  On activate, skenv ${RED}replaces all contents${NC} of these directories"
+        echo -e "  On activate, skenv ${RED}replaces all contents${NC} of this directory"
         echo -e "  with symlinks to the active environment."
         echo ""
-        echo -e "  skenv will snapshot your current skills into a ${BOLD}_pre-skenv${NC} environment,"
+        echo -e "  skenv will snapshot your current skills into a ${BOLD}$pre_name${NC} environment,"
         echo -e "  but we strongly recommend you back them up yourself first."
         echo ""
         echo -n -e "  ${BOLD}Have you backed up your skills? [y/N]${NC} "
@@ -288,7 +348,7 @@ _auto_import() {
                 ;;
             *)
                 _error "Aborting. Please back up your skills first, then try again."
-                _hint "Example: cp -r ~/.claude/skills ~/skills-backup"
+                _hint "Example: cp -r $skills_dir ~/skills-backup-$platform"
                 exit 1
                 ;;
         esac
@@ -296,9 +356,10 @@ _auto_import() {
 
     local imported=0
     mkdir -p "$pre_dir"
+    # Tag the backup env with its platform
+    echo "$platform" > "$pre_dir/.platform"
 
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
-        [[ -d "$skills_dir" ]] || continue
+    if [[ -d "$skills_dir" ]]; then
         for item in "$skills_dir"/*; do
             [[ -e "$item" || -L "$item" ]] || continue
             local name
@@ -318,14 +379,14 @@ _auto_import() {
             fi
             imported=$((imported + 1))
         done
-    done
+    fi
 
     if [[ $imported -gt 0 ]]; then
-        _info "Imported $imported existing skill(s) into ${BOLD}$PRE_SKENV${NC} environment."
-        _hint "Run 'skenv activate $PRE_SKENV' anytime to restore your original skills."
+        _info "Imported $imported existing $platform skill(s) into ${BOLD}$pre_name${NC} environment."
+        _hint "Run 'skenv activate $pre_name' anytime to restore your original $platform skills."
 
         # Offer to copy existing skills into the target environment
-        if [[ -n "$target_env" ]] && [[ "$target_env" != "$PRE_SKENV" ]]; then
+        if [[ -n "$target_env" ]] && [[ "$target_env" != "$pre_name" ]]; then
             local target_dir
             target_dir=$(_env_dir "$target_env")
             local do_import=0
@@ -368,10 +429,13 @@ _auto_import() {
 cmd_create() {
     local name=""
     local from_env=""
+    local platform=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from_env="${2:?--from requires an environment name}"; shift 2 ;;
+            --claude) platform="$PLATFORM_CLAUDE"; shift ;;
+            --copilot) platform="$PLATFORM_COPILOT"; shift ;;
             -*) _error "Unknown flag: $1"; exit 1 ;;
             *)
                 if [[ -z "$name" ]]; then
@@ -384,7 +448,7 @@ cmd_create() {
     done
 
     if [[ -z "$name" ]]; then
-        _error "Usage: skenv create <name> [--from <env>]"
+        _error "Usage: skenv create <name> [--claude|--copilot] [--from <env>]"
         exit 1
     fi
 
@@ -409,18 +473,25 @@ cmd_create() {
 
     if [[ -n "$from_env" ]]; then
         _require_env_exists "$from_env"
+        # If no platform specified, inherit from source env
+        if [[ -z "$platform" ]]; then
+            platform=$(_platform_for_env "$from_env")
+        fi
         local src_dir
         src_dir=$(_env_dir "$from_env")
         cp -r "$src_dir" "$env_dir"
         # Remove metadata files from the copy
         find "$env_dir" -maxdepth 1 -name '*.skenv-meta' -delete 2>/dev/null
         find "$env_dir" -maxdepth 2 -name '.skenv-meta' -delete 2>/dev/null
+        # Set the platform (may differ from source if overridden)
+        echo "${platform:-$DEFAULT_PLATFORM}" > "$env_dir/.platform"
         local count
         count=$(find "$env_dir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
-        _info "Created ${BOLD}$name${NC} from ${BOLD}$from_env${NC} ($count skill(s) copied)"
+        _info "Created ${BOLD}$name${NC} [${platform:-$DEFAULT_PLATFORM}] from ${BOLD}$from_env${NC} ($count skill(s) copied)"
     else
         mkdir -p "$env_dir"
-        _info "Created skill environment: ${BOLD}$name${NC}"
+        echo "${platform:-$DEFAULT_PLATFORM}" > "$env_dir/.platform"
+        _info "Created skill environment: ${BOLD}$name${NC} [${platform:-$DEFAULT_PLATFORM}]"
     fi
     _hint "Activate it with: skenv activate $name"
 }
@@ -437,8 +508,13 @@ cmd_activate() {
     _ensure_home
     _require_env_exists "$name"
 
-    local current
-    current=$(_get_active)
+    local platform
+    platform=$(_platform_for_env "$name")
+    local active_file
+    active_file=$(_active_file_for_platform "$platform")
+
+    local current=""
+    [[ -f "$active_file" ]] && current=$(cat "$active_file")
 
     if [[ "$current" == "$name" ]]; then
         _warn "Environment '$name' is already active."
@@ -448,34 +524,63 @@ cmd_activate() {
     _auto_import "$yes_flag" "$name"
 
     if [[ -n "$current" ]]; then
-        _warn "Switching from: $current"
+        _warn "Switching $platform from: $current"
     fi
 
-    echo "$name" > "$ACTIVE_FILE"
+    echo "$name" > "$active_file"
     _sync_skills "$name"
 
     local count
     count=$(find "$(_env_dir "$name")" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
-    local dirs_list
-    dirs_list=$(printf '%s' "${SKILLS_DIRS[*]// /, }")
-    _info "Activated ${BOLD}$name${NC} ($count skill(s) linked to $dirs_list)"
+    local skills_dir
+    skills_dir=$(_skills_dir_for_platform "$platform")
+    _info "Activated ${BOLD}$name${NC} [$platform] ($count skill(s) linked to $skills_dir)"
 }
 
 cmd_deactivate() {
-    local current
-    current=$(_get_active)
+    local platform="${1:-}"
 
-    if [[ -z "$current" ]]; then
-        _warn "No active environment to deactivate."
-        return 0
-    fi
-
-    for skills_dir in "${SKILLS_DIRS[@]}"; do
+    if [[ -n "$platform" ]]; then
+        # Deactivate specific platform
+        case "$platform" in
+            --claude) platform="$PLATFORM_CLAUDE" ;;
+            --copilot) platform="$PLATFORM_COPILOT" ;;
+            *) _error "Usage: skenv deactivate [--claude|--copilot]"; exit 1 ;;
+        esac
+        local active_file
+        active_file=$(_active_file_for_platform "$platform")
+        if [[ ! -f "$active_file" ]]; then
+            _warn "No active $platform environment to deactivate."
+            return 0
+        fi
+        local current
+        current=$(cat "$active_file")
+        local skills_dir
+        skills_dir=$(_skills_dir_for_platform "$platform")
         _wipe_skills_dir "$skills_dir"
-    done
-
-    rm -f "$ACTIVE_FILE"
-    _info "Deactivated environment: ${BOLD}$current${NC}"
+        rm -f "$active_file"
+        _info "Deactivated $platform environment: ${BOLD}$current${NC}"
+    else
+        # Deactivate all platforms
+        local deactivated=0
+        for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+            local af
+            af=$(_active_file_for_platform "$p")
+            if [[ -f "$af" ]]; then
+                local cur
+                cur=$(cat "$af")
+                local sd
+                sd=$(_skills_dir_for_platform "$p")
+                _wipe_skills_dir "$sd"
+                rm -f "$af"
+                _info "Deactivated $p environment: ${BOLD}$cur${NC}"
+                deactivated=1
+            fi
+        done
+        if [[ $deactivated -eq 0 ]]; then
+            _warn "No active environment to deactivate."
+        fi
+    fi
 }
 
 # --- Skill management commands ---
@@ -586,8 +691,11 @@ cmd_uninstall() {
 
 cmd_list() {
     _ensure_home
-    local current
-    current=$(_get_active)
+
+    local active_claude
+    active_claude=$(_get_active "$PLATFORM_CLAUDE")
+    local active_copilot
+    active_copilot=$(_get_active "$PLATFORM_COPILOT")
 
     local found=0
     for env_dir in "$SKENV_HOME"/*/; do
@@ -597,11 +705,14 @@ cmd_list() {
         name=$(basename "$env_dir")
         local count
         count=$(find "$env_dir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
+        local platform
+        platform=$(_platform_for_env "$name")
+        local ptag="[$platform]"
 
-        if [[ "$name" == "$current" ]]; then
-            echo -e "  ${GREEN}*${NC} ${BOLD}$name${NC}  ($count skills)"
+        if [[ "$name" == "$active_claude" || "$name" == "$active_copilot" ]]; then
+            echo -e "  ${GREEN}*${NC} ${BOLD}$name${NC}  ${CYAN}$ptag${NC}  ($count skills)"
         else
-            echo -e "    $name  ($count skills)"
+            echo -e "    $name  ${CYAN}$ptag${NC}  ($count skills)"
         fi
     done
 
@@ -677,15 +788,19 @@ cmd_ls() {
 }
 
 cmd_status() {
-    local current
-    current=$(_get_active)
-
-    if [[ -z "$current" ]]; then
+    local shown=0
+    for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+        local current
+        current=$(_get_active "$p")
+        if [[ -n "$current" ]]; then
+            local count
+            count=$(find "$(_env_dir "$current")" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
+            echo -e "Active ${CYAN}[$p]${NC}: ${BOLD}${GREEN}$current${NC} ($count skills)"
+            shown=1
+        fi
+    done
+    if [[ $shown -eq 0 ]]; then
         echo -e "No active skill environment."
-    else
-        local count
-        count=$(find "$(_env_dir "$current")" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
-        echo -e "Active environment: ${BOLD}${GREEN}$current${NC} ($count skills)"
     fi
 }
 
@@ -694,22 +809,25 @@ cmd_delete() {
 
     local name_lower
     name_lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
-    local pre_lower
-    pre_lower=$(echo "$PRE_SKENV" | tr '[:upper:]' '[:lower:]')
-    if [[ "$name_lower" == "$pre_lower" ]]; then
-        _error "Cannot delete '$PRE_SKENV' — it contains your original skills backup."
-        _hint "Use 'skenv clone $PRE_SKENV <name>' to copy it, or force with: rm -rf \$SKENV_HOME/$PRE_SKENV"
+    if [[ "$name_lower" == _pre-skenv-* ]]; then
+        _error "Cannot delete '$name' — it contains your original skills backup."
+        _hint "Use 'skenv clone $name <newname>' to copy it, or force with: rm -rf \$SKENV_HOME/$name"
         exit 1
     fi
 
     _require_env_exists "$name"
 
+    local platform
+    platform=$(_platform_for_env "$name")
     local current
-    current=$(_get_active)
+    current=$(_get_active "$platform")
 
     if [[ "$current" == "$name" ]]; then
         _warn "Deactivating '$name' before deletion."
-        cmd_deactivate
+        local skills_dir
+        skills_dir=$(_skills_dir_for_platform "$platform")
+        _wipe_skills_dir "$skills_dir"
+        rm -f "$(_active_file_for_platform "$platform")"
     fi
 
     rm -rf "$(_env_dir "$name")"
@@ -777,12 +895,15 @@ cmd_base() {
             fi
             _info "Installed ${BOLD}$skill_name${NC} into ${BOLD}base layer${NC}"
 
-            local current
-            current=$(_get_active)
-            if [[ -n "$current" ]]; then
-                _sync_skills "$current"
-                _hint "Active environment updated."
-            fi
+            # Re-sync all active environments (base is universal)
+            for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+                local current
+                current=$(_get_active "$p")
+                if [[ -n "$current" ]]; then
+                    _sync_skills "$current"
+                fi
+            done
+            _hint "Active environment(s) updated."
             ;;
         uninstall)
             local skill_name="${1:?Usage: skenv base uninstall <skill-name>}"
@@ -794,12 +915,15 @@ cmd_base() {
             rm -rf "$target"
             _info "Uninstalled ${BOLD}$skill_name${NC} from ${BOLD}base layer${NC}"
 
-            local current
-            current=$(_get_active)
-            if [[ -n "$current" ]]; then
-                _sync_skills "$current"
-                _hint "Active environment updated."
-            fi
+            # Re-sync all active environments (base is universal)
+            for p in "$PLATFORM_CLAUDE" "$PLATFORM_COPILOT"; do
+                local current
+                current=$(_get_active "$p")
+                if [[ -n "$current" ]]; then
+                    _sync_skills "$current"
+                fi
+            done
+            _hint "Active environment(s) updated."
             ;;
         ls)
             echo -e "${BOLD}Base layer skills (always active):${NC}"
@@ -901,6 +1025,7 @@ cmd_freeze() {
 
     echo "# skenv manifest for: $env_name"
     echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# Platform: $(_platform_for_env "$env_name")"
     echo ""
 
     for skill in "$env_dir"/*; do
@@ -932,13 +1057,16 @@ cmd_freeze() {
 }
 
 cmd_init() {
-    local name="${1:?Usage: skenv init <name> --from <manifest>}"
+    local name="${1:?Usage: skenv init <name> --from <manifest> [--claude|--copilot]}"
     shift
 
     local manifest=""
+    local platform=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) manifest="$2"; shift 2 ;;
+            --claude) platform="$PLATFORM_CLAUDE"; shift ;;
+            --copilot) platform="$PLATFORM_COPILOT"; shift ;;
             *) _error "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -954,7 +1082,19 @@ cmd_init() {
         exit 1
     fi
 
-    cmd_create "$name"
+    # Read platform from manifest if not specified via flag
+    if [[ -z "$platform" ]]; then
+        platform=$(grep '^# Platform:' "$manifest" 2>/dev/null | sed 's/^# Platform: *//' | head -1)
+    fi
+
+    # Create env with correct platform flag
+    local create_args=("$name")
+    if [[ "$platform" == "$PLATFORM_COPILOT" ]]; then
+        create_args+=("--copilot")
+    elif [[ -n "$platform" ]]; then
+        create_args+=("--claude")
+    fi
+    cmd_create "${create_args[@]}"
 
     local env_dir
     env_dir=$(_env_dir "$name")
@@ -1009,6 +1149,15 @@ cmd_inherit() {
         exit 1
     fi
 
+    # Enforce same platform
+    local child_platform parent_platform
+    child_platform=$(_platform_for_env "$child")
+    parent_platform=$(_platform_for_env "$parent")
+    if [[ "$child_platform" != "$parent_platform" ]]; then
+        _error "Cannot inherit across platforms: '$child' is $child_platform, '$parent' is $parent_platform."
+        exit 1
+    fi
+
     # Validate no cycles BEFORE writing .parent
     local parent_file="$(_env_dir "$child")/.parent"
     local old_parent=""
@@ -1031,7 +1180,7 @@ cmd_inherit() {
     _info "${BOLD}$child${NC} now inherits from ${BOLD}$parent${NC}"
 
     local current
-    current=$(_get_active)
+    current=$(_get_active "$child_platform")
     if [[ "$current" == "$child" ]]; then
         _sync_skills "$child"
         _hint "Active environment updated."
@@ -1057,26 +1206,30 @@ cmd_run() {
         exit 1
     fi
 
-    local previous
-    previous=$(_get_active)
+    local platform
+    platform=$(_platform_for_env "$env_name")
+    local active_file
+    active_file=$(_active_file_for_platform "$platform")
+    local previous=""
+    [[ -f "$active_file" ]] && previous=$(cat "$active_file")
 
     _ensure_home
 
     # Trap to restore state on signals
     _cmd_run_restore() {
         if [[ -n "$previous" ]]; then
-            echo "$previous" > "$ACTIVE_FILE"
+            echo "$previous" > "$active_file"
             _sync_skills "$previous"
         else
-            rm -f "$ACTIVE_FILE"
-            for skills_dir in "${SKILLS_DIRS[@]}"; do
-                _wipe_skills_dir "$skills_dir"
-            done
+            rm -f "$active_file"
+            local sd
+            sd=$(_skills_dir_for_platform "$platform")
+            _wipe_skills_dir "$sd"
         fi
     }
     trap _cmd_run_restore EXIT
 
-    echo "$env_name" > "$ACTIVE_FILE"
+    echo "$env_name" > "$active_file"
     _sync_skills "$env_name"
 
     local exit_code=0
@@ -1181,8 +1334,15 @@ _skenv_auto_activate() {
         if [[ -f "$dir/.skenv" ]]; then
             local env_name
             env_name=$(cat "$dir/.skenv" | tr -d '[:space:]')
+            local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
+            # Read env's platform
+            local platform="claude"
+            if [[ -f "$skenv_home/$env_name/.platform" ]]; then
+                platform=$(cat "$skenv_home/$env_name/.platform")
+            fi
+            local active_file="$skenv_home/.active-$platform"
             local current=""
-            [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && current=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+            [[ -f "$active_file" ]] && current=$(cat "$active_file")
             if [[ -n "$env_name" && "$env_name" != "$current" ]]; then
                 # Don't retry a failed activation
                 if [[ "${_skenv_last_failed:-}" == "$env_name" ]]; then
@@ -1202,10 +1362,24 @@ _skenv_auto_activate() {
 }
 
 _skenv_prompt() {
-    local active=""
-    [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && active=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
-    if [[ -n "$active" ]]; then
-        echo "[skenv:${active}] "
+    local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
+    local parts=""
+    for p in claude copilot; do
+        local af="$skenv_home/.active-$p"
+        if [[ -f "$af" ]]; then
+            local val
+            val=$(cat "$af")
+            if [[ -n "$val" ]]; then
+                if [[ -n "$parts" ]]; then
+                    parts="$parts $p:$val"
+                else
+                    parts="$p:$val"
+                fi
+            fi
+        fi
+    done
+    if [[ -n "$parts" ]]; then
+        echo "[skenv:${parts}] "
     fi
 }
 
@@ -1254,19 +1428,28 @@ _skenv_completions() {
             ;;
         activate|delete|ls|inherit|run)
             local envs=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/" 2>/dev/null | grep -v '^\.')
-            COMPREPLY=($(compgen -W "$envs" -- "$cur"))
+            COMPREPLY=($(compgen -W "$envs --claude --copilot" -- "$cur"))
             ;;
         clone|diff)
             local envs=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/" 2>/dev/null | grep -v '^\.')
             COMPREPLY=($(compgen -W "$envs" -- "$cur"))
             ;;
         uninstall)
+            local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
             local active=""
-            [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && active=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+            for p in claude copilot; do
+                [[ -f "$skenv_home/.active-$p" ]] && active=$(cat "$skenv_home/.active-$p") && break
+            done
             if [[ -n "$active" ]]; then
-                local skills=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/$active/" 2>/dev/null)
+                local skills=$(ls -1 "$skenv_home/$active/" 2>/dev/null)
                 COMPREPLY=($(compgen -W "$skills" -- "$cur"))
             fi
+            ;;
+        create)
+            COMPREPLY=($(compgen -W "--claude --copilot --from" -- "$cur"))
+            ;;
+        deactivate)
+            COMPREPLY=($(compgen -W "--claude --copilot" -- "$cur"))
             ;;
         base)
             COMPREPLY=($(compgen -W "install uninstall ls" -- "$cur"))
@@ -1323,6 +1506,10 @@ _skenv() {
     elif (( CURRENT >= 3 )); then
         local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
         case "${words[2]}" in
+            create)
+                local -a flags=('--claude' '--copilot' '--from')
+                _describe 'flag' flags
+                ;;
             activate|delete|ls|inherit|run|diff)
                 envs=($(ls -1 "$skenv_home/" 2>/dev/null | grep -v '^\.'))
                 _describe 'environment' envs
@@ -1331,9 +1518,15 @@ _skenv() {
                 envs=($(ls -1 "$skenv_home/" 2>/dev/null | grep -v '^\.'))
                 _describe 'environment' envs
                 ;;
+            deactivate)
+                local -a flags=('--claude' '--copilot')
+                _describe 'flag' flags
+                ;;
             uninstall)
                 local active=""
-                [[ -f "$skenv_home/.active" ]] && active=$(cat "$skenv_home/.active")
+                for p in claude copilot; do
+                    [[ -f "$skenv_home/.active-$p" ]] && active=$(cat "$skenv_home/.active-$p") && break
+                done
                 if [[ -n "$active" ]]; then
                     skills=($(ls -1 "$skenv_home/$active/" 2>/dev/null))
                     _describe 'skill' skills
@@ -1389,26 +1582,35 @@ USAGE:
   skenv <command> [arguments]
 
 COMMANDS:
-  create <name> [--from <env>] Create a new skill environment (optionally from existing)
-  activate [-y] <name>      Activate env (clean swap into ~/.claude/skills/ & ~/.copilot/skills/)
-  deactivate                 Deactivate (removes all skills from discovery dirs)
-  install <path> [opts]      Install a skill (--env N, --link)
-  uninstall <name> [opts]    Remove a skill (--env N)
-  list                       List all environments (* = active)
-  ls [name]                  List skills in an environment (default: active)
-  status                     Show current active environment
-  clone <src> <dst>          Clone an environment
-  delete <name>              Delete an environment
-  base install|uninstall|ls  Manage base layer (always-on skills)
-  diff <env-a> <env-b>       Compare two environments
-  freeze [name]              Export env as manifest (pipe to file)
-  init <name> --from <file>  Recreate env from manifest
-  inherit <child> <parent>   Set env inheritance
-  run <env> -- <cmd...>      Run command with temporary env
-  registry add|remove|list   Manage skill registry
-  hook [bash|zsh]            Print shell hook (auto-activate + prompt)
-  completion [bash|zsh]      Print tab completion script
-  help                       Show this help
+  create <name> [opts]         Create a new skill environment
+                               --claude (default) or --copilot to set platform
+                               --from <env> to copy from existing env
+  activate [-y] <name>         Activate env (symlinks into platform's skills dir)
+  deactivate [--claude|--copilot]  Deactivate env(s) (no flag = deactivate all)
+  install <path> [opts]        Install a skill (--env N, --link)
+  uninstall <name> [opts]      Remove a skill (--env N)
+  list                         List all environments (* = active, shows platform)
+  ls [name]                    List skills in an environment (default: active)
+  status                       Show active environment(s) per platform
+  clone <src> <dst>            Clone an environment (preserves platform)
+  delete <name>                Delete an environment
+  base install|uninstall|ls    Manage base layer (always-on skills, all platforms)
+  diff <env-a> <env-b>         Compare two environments
+  freeze [name]                Export env as manifest (pipe to file)
+  init <name> --from <file>    Recreate env from manifest (--claude|--copilot)
+  inherit <child> <parent>     Set env inheritance (same platform only)
+  run <env> -- <cmd...>        Run command with temporary env
+  registry add|remove|list     Manage skill registry
+  hook [bash|zsh]              Print shell hook (auto-activate + prompt)
+  completion [bash|zsh]        Print tab completion script
+  help                         Show this help
+
+PLATFORMS:
+  Each environment targets exactly one platform:
+    --claude   → manages ~/.claude/skills/   (default)
+    --copilot  → manages ~/.copilot/skills/
+
+  You can have one active env per platform simultaneously.
 
 ENVIRONMENT VARIABLES:
   SKENV_HOME            Base directory for envs (default: ~/.skenv)
@@ -1419,25 +1621,25 @@ SETUP:
   eval "$(skenv completion zsh)"      # tab completion
 
 EXAMPLES:
-  skenv create research
-  skenv activate research
-  skenv install ~/my-skills/zsh-shell
+  skenv create research                   # claude env (default)
+  skenv create copilot-dev --copilot      # copilot env
+  skenv activate research                 # activates in ~/.claude/skills/
+  skenv activate copilot-dev              # activates in ~/.copilot/skills/
+  skenv status                            # shows both active envs
+
   skenv install ~/my-skills/python-research --link
   skenv base install ~/my-skills/always-on-skill
   skenv ls
 
-  skenv create webdev
-  skenv activate webdev               # clean switch — only webdev skills
-  skenv install react-patterns        # install from registry
+  skenv deactivate --claude               # deactivate only claude
+  skenv deactivate                        # deactivate all
 
-  skenv freeze > research.manifest    # export
+  skenv freeze > research.manifest        # export (includes platform)
   skenv init research-v2 --from research.manifest  # recreate
 
-  skenv inherit research-v2 research  # research-v2 extends research
-  skenv run research -- claude        # temporary activation
-
-  skenv list                          # shows all envs, * marks active
-  skenv diff research webdev          # compare two envs
+  skenv inherit research-v2 research      # must be same platform
+  skenv run research -- claude            # temporary activation
+  skenv diff research webdev              # compare two envs
 EOF
 }
 

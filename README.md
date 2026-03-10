@@ -1,10 +1,12 @@
 # skenv
 
-**virtualenv for AI coding skills.** Manage separate skill sets for Claude Code and GitHub Copilot CLI — switch between them instantly.
+**virtualenv for AI coding skills.** Manage separate skill environments for Claude Code or GitHub Copilot CLI — switch between them instantly.
 
 ```
-skenv activate research     # Claude & Copilot see research skills
-skenv activate webdev       # now they see webdev skills instead
+skenv create research --copilot     # copilot environment
+skenv create research               # claude environment (default)
+skenv activate research             # copilot sees research skills
+skenv activate webdev               # switch — now copilot sees webdev skills
 ```
 
 ---
@@ -18,33 +20,37 @@ curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -
 chmod +x ~/.local/bin/skenv
 export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc to make permanent
 
-# 2. Create and activate — imports your existing skills automatically
-skenv create research
-skenv activate research       # asks to backup, then offers to import existing skills
+# 2. Create and activate
+skenv create myenv --copilot          # or just `skenv create myenv` for claude
+skenv activate myenv                  # first time: asks to backup, offers to import existing skills
 
-# 3. Create another from an existing environment
-skenv create webdev --from research
-skenv activate webdev
-skenv uninstall python-research   # remove what you don't need
-skenv install ~/my-skills/react-patterns
+# 3. Install skills into the environment
+skenv install ~/my-skills/python-research
+skenv install ~/my-skills/react-patterns --link   # symlink (stays in sync with source)
 
-# Switch between them
-skenv activate research
+# 4. Create another and switch
+skenv create webdev --copilot
+skenv activate webdev                 # clean swap — only webdev skills visible
+
+# 5. Check what's active
+skenv status                          # shows active env per platform
+skenv ls                              # list skills in active env
 ```
 
-> **First-time safety:** The very first `skenv activate` asks you to confirm you've backed up your skills, snapshots them into `_pre-skenv`, then offers to import them into your new environment. Use `-y` / `SKENV_YES=1` to skip prompts in scripts.
+> **First-time safety:** The first `skenv activate` for each platform asks you to confirm backup, snapshots existing skills into `_pre-skenv-<platform>`, then offers to import them into your new environment. Use `-y` / `SKENV_YES=1` to skip prompts in scripts.
 
 ---
 
 ## Why skenv?
 
-Claude Code and Copilot CLI discover skills from folders on disk (`~/.claude/skills/` and `~/.copilot/skills/`). If you work on different kinds of projects, you need different skills — but there's no built-in way to swap them.
+Claude Code reads skills from `~/.claude/skills/`, Copilot CLI from `~/.copilot/skills/`. If you work on different projects, you need different skill sets — but there's no built-in way to swap them.
 
 **skenv** solves this the same way Python's `venv` solves package management:
 
-- Each environment is **fully isolated** — activating one replaces all skills
-- Environments are stored centrally, skills are **copied** (self-contained)
-- A **base layer** lets you keep always-on skills across all environments
+- Each environment targets a **single platform** (`--claude` or `--copilot`)
+- Activating an env does a **clean swap** — only that env's skills are visible
+- You can have **one env per platform** active simultaneously
+- A **base layer** provides always-on skills across all environments
 - Environments can **inherit** from each other to avoid duplication
 
 ---
@@ -90,7 +96,7 @@ eval "$(skenv completion zsh)"    # tab completion
 Replace `zsh` with `bash` if needed. This gives you:
 
 - **Auto-activation:** Put a `.skenv` file in any project directory (containing an env name), and skenv activates it automatically when you `cd` in.
-- **Prompt indicator:** Shows `[skenv:research]` when an env is active.
+- **Prompt indicator:** Shows `[skenv:copilot:myenv]` when an env is active.
 - **Tab completion:** Complete commands, environment names, and skill names.
 
 #### Prompt setup
@@ -117,35 +123,32 @@ PS1='$(_skenv_prompt)\u@\h:\w\$ '
 ## How It Works
 
 ```
-~/.skenv/                          SKENV_HOME (all envs live here)
-|-- .active                        tracks which env is active
-|-- .base/                         base layer (always-on skills)
+~/.skenv/                                SKENV_HOME (all envs live here)
+|-- .active-claude                       tracks active claude env
+|-- .active-copilot                      tracks active copilot env
+|-- .base/                               base layer (always-on skills)
 |   `-- always-zsh/
 |       `-- SKILL.md
-|-- .registry                      name-to-path mappings
-|-- _pre-skenv/                    auto-backup of your original skills
-|   |-- zsh-shell/
-|   `-- my-linter -> ~/tools/custom-skills/my-linter
-|-- research/                      an environment
+|-- .registry                            name-to-path mappings
+|-- _pre-skenv-copilot/                  auto-backup of original copilot skills
+|-- research/                            a copilot environment
+|   |-- .platform                        contains "copilot"
 |   |-- python-research/
 |   |   |-- SKILL.md
 |   |   `-- .skenv-meta
 |   `-- latex-paper/
 |       `-- SKILL.md
-`-- webdev/                        another environment
-    |-- react-patterns -> ~/skills/react-patterns   (--link mode)
+`-- webdev/                              a claude environment
+    |-- .platform                        contains "claude"
+    |-- react-patterns -> ~/skills/react  (--link mode)
     `-- react-patterns.skenv-meta
 
-~/.claude/skills/                  Claude Code reads from here
-|-- always-zsh -> ~/.skenv/.base/always-zsh
-`-- python-research -> ~/.skenv/research/python-research
-
-~/.copilot/skills/                 Copilot CLI reads from here
+~/.copilot/skills/                       Copilot CLI reads from here
 |-- always-zsh -> ~/.skenv/.base/always-zsh
 `-- python-research -> ~/.skenv/research/python-research
 ```
 
-**On `activate`:** skenv wipes both skill directories, then symlinks: base layer first, then the environment's skills. This is a clean swap — only the active env's skills are visible.
+**On `activate`:** skenv wipes the platform's skill directory, then symlinks: base layer first, then the environment's skills. Only one env per platform is active at a time.
 
 **Layering order** (later wins on name conflict):
 
@@ -155,18 +158,46 @@ base layer  ->  parent envs (if inherited)  ->  active env
 
 ---
 
+## Platforms
+
+Each environment targets exactly one platform, set at creation time:
+
+| Flag | Skills directory | Default |
+|------|-----------------|---------|
+| `--claude` | `~/.claude/skills/` | ✓ (default) |
+| `--copilot` | `~/.copilot/skills/` | |
+
+```bash
+skenv create my-claude-env               # targets ~/.claude/skills/
+skenv create my-copilot-env --copilot    # targets ~/.copilot/skills/
+```
+
+You can have **one env per platform active simultaneously**:
+
+```bash
+skenv activate my-claude-env             # activates in ~/.claude/skills/
+skenv activate my-copilot-env            # activates in ~/.copilot/skills/ — both are now active
+skenv status
+# Active [claude]: my-claude-env (5 skills)
+# Active [copilot]: my-copilot-env (8 skills)
+```
+
+The platform is locked to the environment — it cannot be changed after creation. Inheritance only works between envs on the same platform.
+
+---
+
 ## Commands
 
 ### Environment management
 
 | Command | Description |
 |---------|-------------|
-| `skenv create <name> [--from <env>]` | Create a new environment (optionally from existing) |
-| `skenv activate [-y\|--yes] <name>` | Activate env — clean swap into skill directories |
-| `skenv deactivate` | Remove all symlinks, clear active env |
-| `skenv list` | List all environments (`*` = active) |
-| `skenv status` | Show which env is currently active |
-| `skenv clone <src> <dst>` | Deep-copy an environment |
+| `skenv create <name> [--claude\|--copilot] [--from <env>]` | Create a new environment |
+| `skenv activate [-y\|--yes] <name>` | Activate env — clean swap into platform's skills dir |
+| `skenv deactivate [--claude\|--copilot]` | Deactivate env(s). No flag = deactivate all |
+| `skenv list` | List all environments (`*` = active, shows platform) |
+| `skenv status` | Show active env per platform |
+| `skenv clone <src> <dst>` | Deep-copy an environment (preserves platform) |
 | `skenv delete <name>` | Delete an environment |
 | `skenv diff <a> <b>` | Compare skills between two environments |
 
@@ -190,9 +221,9 @@ base layer  ->  parent envs (if inherited)  ->  active env
 
 | Command | Description |
 |---------|-------------|
-| `skenv inherit <child> <parent>` | Child env inherits parent's skills |
+| `skenv inherit <child> <parent>` | Child env inherits parent's skills (same platform only) |
 | `skenv freeze [name]` | Export env as a manifest file |
-| `skenv init <name> --from <file>` | Recreate env from a manifest |
+| `skenv init <name> --from <file> [--claude\|--copilot]` | Recreate env from a manifest |
 | `skenv run <env> -- <cmd...>` | Run a command with a temporary env |
 | `skenv registry add <name> <path>` | Register a skill by name |
 | `skenv registry remove <name>` | Unregister a skill |
@@ -206,10 +237,10 @@ base layer  ->  parent envs (if inherited)  ->  active env
 
 ### Environments
 
-An environment is a named collection of skills stored in `~/.skenv/<name>/`. Only one env is active at a time. Activating an env does a **clean swap** — the skill directories contain _only_ that env's skills (plus the base layer).
+An environment is a named collection of skills stored in `~/.skenv/<name>/`. Each env targets a single platform (`claude` or `copilot`). Activating an env does a **clean swap** — the platform's skill directory contains _only_ that env's skills (plus the base layer).
 
 ```bash
-skenv create research
+skenv create research --copilot
 skenv activate research
 skenv install ~/my-skills/python-research
 skenv install ~/my-skills/latex-paper
@@ -218,7 +249,7 @@ skenv ls
 
 ### Base Layer
 
-Skills in the base layer are **always present** regardless of which env is active. Use this for skills you want everywhere (e.g., a shell helper skill).
+Skills in the base layer are **always present** regardless of which env is active. Use this for skills you want everywhere (e.g., a shell helper skill). Base layer skills are synced to whichever platform is active.
 
 ```bash
 skenv base install ~/my-skills/always-zsh
@@ -229,7 +260,7 @@ Base skills are overridden if the active env has a skill with the same name.
 
 ### Linked vs Copied Skills
 
-By default, `skenv install` **copies** the skill into the env — self-contained, won't break if you delete the source. Use `--link` to **symlink** instead — edits to the source propagate immediately.
+By default, `skenv install` **copies** the skill into the env — self-contained, won't break if you delete the source. Use `--link` to **symlink** instead — edits to the source propagate immediately. Use `--link` for skills under active development.
 
 ```bash
 skenv install ~/my-skills/foo            # copy (independent)
@@ -240,12 +271,12 @@ skenv install ~/my-skills/foo --link     # symlink (stays in sync)
 
 ### Inheritance
 
-An environment can inherit from a parent. The child sees all of the parent's skills plus its own. Child skills win on name conflict.
+An environment can inherit from a parent (same platform only). The child sees all of the parent's skills plus its own. Child skills win on name conflict.
 
 ```bash
-skenv create research-v2
-skenv inherit research-v2 research
-skenv activate research-v2    # sees research skills + research-v2 skills
+skenv create research-v2 --copilot
+skenv inherit research-v2 research       # both must be copilot
+skenv activate research-v2               # sees research skills + research-v2 skills
 ```
 
 ### Registry
@@ -269,7 +300,7 @@ skenv freeze > research.manifest
 skenv init research-v2 --from research.manifest
 ```
 
-The manifest records each skill's name, source path, and install mode (`copy` or `link`). Base layer skills are prefixed with `@base:`.
+The manifest records each skill's name, source path, install mode, and platform. Base layer skills are prefixed with `@base:`.
 
 ### Auto-Activation
 
@@ -297,10 +328,7 @@ skenv run webdev -- claude "review this React component"
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SKENV_HOME` | `~/.skenv` | Root directory for all environments |
-
-Skill directories synced on activate (hardcoded):
-- `~/.claude/skills/` — Claude Code
-- `~/.copilot/skills/` — GitHub Copilot CLI
+| `SKENV_YES` | unset | Set to `1` to skip confirmation prompts |
 
 ---
 
@@ -318,13 +346,13 @@ my-skill/
 ## FAQ
 
 **Q: What happens to my existing skills on first use?**
-They're automatically backed up into the `_pre-skenv` environment on first activate (after you confirm). Run `skenv activate _pre-skenv` to restore them. This env is protected from deletion.
+They're automatically backed up into a `_pre-skenv-<platform>` environment on the first activate for each platform (after you confirm). Run `skenv activate _pre-skenv-copilot` to restore them. These envs are protected from deletion.
 
 **Q: What does `deactivate` do?**
-It removes all skills from the discovery directories. No env active = no skills visible. This matches how Python's `deactivate` removes the venv from your PATH.
+With no flag, it deactivates all active environments. Use `--claude` or `--copilot` to deactivate only one platform. Deactivating removes all skills from the platform's discovery directory.
 
-**Q: Can I use skenv with only Claude Code or only Copilot CLI?**
-Yes. skenv syncs to both directories, but if one doesn't exist, it simply creates it. Each tool only reads from its own directory.
+**Q: Can I have both a Claude and Copilot env active at the same time?**
+Yes. Each platform has its own active slot. Activating a copilot env doesn't affect the active claude env, and vice versa.
 
 **Q: Does it work on Linux?**
 Yes. It's pure bash (3.2+) with no external dependencies. Works on macOS and Linux.
