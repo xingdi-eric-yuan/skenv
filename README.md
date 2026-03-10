@@ -13,9 +13,10 @@ skenv activate webdev       # now they see webdev skills instead
 
 ```bash
 # 1. Install
-mkdir -p ~/bin
-curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -o ~/bin/skenv
-chmod +x ~/bin/skenv
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -o ~/.local/bin/skenv
+chmod +x ~/.local/bin/skenv
+export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc to make permanent
 
 # 2. Create and activate — imports your existing skills automatically
 skenv create research
@@ -53,19 +54,29 @@ Claude Code and Copilot CLI discover skills from folders on disk (`~/.claude/ski
 ### Option A: Direct download
 
 ```bash
-mkdir -p ~/bin
-curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -o ~/bin/skenv
-chmod +x ~/bin/skenv
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -o ~/.local/bin/skenv
+chmod +x ~/.local/bin/skenv
 ```
 
 ### Option B: Clone and symlink
 
 ```bash
 git clone https://github.com/xingdi-eric-yuan/skenv.git ~/.skenv-repo
-ln -sf ~/.skenv-repo/skenv ~/bin/skenv
+ln -sf ~/.skenv-repo/skenv ~/.local/bin/skenv
 ```
 
-> Make sure `~/bin` (or wherever you place it) is on your `$PATH`.
+Then make sure `~/.local/bin` is on your `$PATH`. Add this to your `~/.zshrc` or `~/.bashrc` if it isn't already:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Reload your shell (`source ~/.zshrc`) or open a new terminal, then verify:
+
+```bash
+skenv help
+```
 
 ### Shell integration (optional but recommended)
 
