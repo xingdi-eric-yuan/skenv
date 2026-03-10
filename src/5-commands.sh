@@ -51,7 +51,7 @@ cmd_create() {
         find "$env_dir" -maxdepth 1 -name '*.skenv-meta' -delete 2>/dev/null
         find "$env_dir" -maxdepth 2 -name '.skenv-meta' -delete 2>/dev/null
         local count
-        count=$(find "$env_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        count=$(find "$env_dir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
         _info "Created ${BOLD}$name${NC} from ${BOLD}$from_env${NC} ($count skill(s) copied)"
     else
         mkdir -p "$env_dir"
@@ -90,7 +90,7 @@ cmd_activate() {
     _sync_skills "$name"
 
     local count
-    count=$(find "$(_env_dir "$name")" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    count=$(find "$(_env_dir "$name")" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
     local dirs_list
     dirs_list=$(printf '%s' "${SKILLS_DIRS[*]// /, }")
     _info "Activated ${BOLD}$name${NC} ($count skill(s) linked to $dirs_list)"
@@ -231,7 +231,7 @@ cmd_list() {
         local name
         name=$(basename "$env_dir")
         local count
-        count=$(find "$env_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        count=$(find "$env_dir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
 
         if [[ "$name" == "$current" ]]; then
             echo -e "  ${GREEN}*${NC} ${BOLD}$name${NC}  ($count skills)"
@@ -319,7 +319,7 @@ cmd_status() {
         echo -e "No active skill environment."
     else
         local count
-        count=$(find "$(_env_dir "$current")" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        count=$(find "$(_env_dir "$current")" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -not -name '.*' -not -name '*.skenv-meta' 2>/dev/null | wc -l | tr -d ' ')
         echo -e "Active environment: ${BOLD}${GREEN}$current${NC} ($count skills)"
     fi
 }
