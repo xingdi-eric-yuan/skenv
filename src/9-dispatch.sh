@@ -14,6 +14,7 @@ COMMANDS:
   activate [-y] <name>         Activate env (symlinks into platform's skills dir)
   deactivate [--claude|--copilot]  Deactivate env(s) (no flag = deactivate all)
   install <path> [opts]        Install a skill (--env N, --link)
+  install-package <path> [opts]  Install a skill package (skills + hooks)
   uninstall <name> [opts]      Remove a skill (--env N)
   list                         List all environments (* = active, shows platform)
   ls [name]                    List skills in an environment (default: active)
@@ -26,6 +27,7 @@ COMMANDS:
   init <name> --from <file>    Recreate env from manifest (--claude|--copilot)
   inherit <child> <parent>     Set env inheritance (same platform only)
   run <env> -- <cmd...>        Run command with temporary env
+  hooks apply|remove|list      Manage project-level hooks from installed packages
   registry add|remove|list     Manage skill registry
   hook [bash|zsh]              Print shell hook (auto-activate + prompt)
   completion [bash|zsh]        Print tab completion script
@@ -59,6 +61,11 @@ EXAMPLES:
 
   skenv deactivate --claude               # deactivate only claude
   skenv deactivate                        # deactivate all
+
+  skenv install-package ~/ShadowFrog --link  # install skills + hooks
+  skenv hooks apply                          # apply hooks to current project
+  skenv hooks list                           # show installed hook packages
+  skenv hooks remove ShadowFrog              # remove hooks from project
 
   skenv freeze > research.manifest        # export (includes platform)
   skenv init research-v2 --from research.manifest  # recreate
@@ -99,6 +106,8 @@ case "$command" in
     init)       cmd_init "$@" ;;
     inherit)    cmd_inherit "$@" ;;
     run)        cmd_run "$@" ;;
+    install-package) cmd_install_package "$@" ;;
+    hooks)      cmd_hooks "$@" ;;
     registry)   cmd_registry "$@" ;;
     hook)       cmd_hook "$@" ;;
     completion) cmd_completion "$@" ;;

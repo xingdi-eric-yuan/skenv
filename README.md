@@ -206,8 +206,17 @@ The platform is locked to the environment — it cannot be changed after creatio
 | Command | Description |
 |---------|-------------|
 | `skenv install <path> [--env N] [--link]` | Install a skill (copy or symlink) |
+| `skenv install-package <path> [--env N] [--link]` | Install a skill package (skills + hooks) |
 | `skenv uninstall <name> [--env N]` | Remove a skill |
 | `skenv ls [name]` | List skills in an env (default: active) |
+
+### Hooks (project-level lifecycle triggers)
+
+| Command | Description |
+|---------|-------------|
+| `skenv hooks apply [pkg] [--project <dir>]` | Apply hooks from installed packages to a project |
+| `skenv hooks remove <pkg> [--project <dir>]` | Remove a package's hooks from a project |
+| `skenv hooks list [--env <name>]` | List installed hook packages and their events |
 
 ### Base layer (always-on skills)
 
@@ -268,6 +277,52 @@ skenv install ~/my-skills/foo --link     # symlink (stays in sync)
 ```
 
 `skenv ls` shows `(linked)` for symlinked skills and `(outdated)` for copied skills whose source has changed.
+
+### Packages and Hooks
+
+A **package** is a directory containing `skills/` and optionally `hooks/`:
+
+```
+ShadowFrog/
+├── skills/
+│   ├── shadow-frog/SKILL.md
+│   ├── shadow-frog-init/SKILL.md
+│   └── ...
+└── hooks/
+    ├── shadow-frog-hooks.json      # hook definitions
+    └── scripts/
+        ├── shadow-frog-check-init.sh
+        └── ...
+```
+
+Install the entire package with one command:
+
+```bash
+skenv install-package ~/ShadowFrog --link
+# ✓ Installed package ShadowFrog into myenv (4 skill(s), 3 hook(s))
+```
+
+**Skills vs hooks scope:** Skills are user-scoped (managed globally by skenv). Hooks are project-scoped — they fire at lifecycle events (sessionStart, postToolUse, etc.) and must be applied to each project that needs them:
+
+```bash
+cd ~/projects/my-app
+skenv hooks apply                     # applies all hook packages to current project
+skenv hooks apply ShadowFrog          # apply specific package only
+skenv hooks list                      # show installed hook packages
+
+cd ~/projects/other-app
+skenv hooks apply                     # each project gets its own hooks
+```
+
+When applied, hooks are **merged** into the project's hook config (not replaced), so multiple packages can coexist. Each entry is tagged with its source package for clean removal:
+
+```bash
+skenv hooks remove ShadowFrog         # unmerges only ShadowFrog's hooks
+```
+
+Hook format is platform-aware:
+- **Copilot:** merges into `.github/hooks/hooks.json`, symlinks scripts to `.github/hooks/scripts/`
+- **Claude:** merges into `.claude/settings.json`, converts event names and format automatically
 
 ### Inheritance
 

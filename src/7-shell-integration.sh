@@ -100,7 +100,7 @@ _skenv_completions() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="create activate deactivate install uninstall list ls status clone delete base diff freeze init inherit run registry hook completion help"
+    commands="create activate deactivate install install-package uninstall list ls status clone delete base diff freeze init inherit run hooks registry hook completion help"
 
     case "$prev" in
         skenv)
@@ -137,6 +137,12 @@ _skenv_completions() {
         registry)
             COMPREPLY=($(compgen -W "add remove list" -- "$cur"))
             ;;
+        hooks)
+            COMPREPLY=($(compgen -W "apply remove list" -- "$cur"))
+            ;;
+        install-package)
+            COMPREPLY=($(compgen -d -- "$cur"))
+            ;;
         hook|completion)
             COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
             ;;
@@ -163,6 +169,7 @@ _skenv() {
         'activate:Activate an environment'
         'deactivate:Deactivate the current environment'
         'install:Install a skill into an environment'
+        'install-package:Install a skill package (skills + hooks)'
         'uninstall:Remove a skill from an environment'
         'list:List all environments'
         'ls:List skills in an environment'
@@ -175,6 +182,7 @@ _skenv() {
         'init:Create env from manifest'
         'inherit:Set env inheritance'
         'run:Run command with temporary env'
+        'hooks:Manage project-level hooks'
         'registry:Manage skill registry'
         'hook:Print shell hook'
         'completion:Print shell completions'
@@ -218,6 +226,15 @@ _skenv() {
                     local -a regnames
                     regnames=($(cut -d'|' -f1 "$skenv_home/.registry" 2>/dev/null))
                     _describe 'registry skill' regnames
+                fi
+                ;;
+            install-package)
+                _files -/
+                ;;
+            hooks)
+                if (( CURRENT == 3 )); then
+                    local -a subcmds=('apply' 'remove' 'list')
+                    _describe 'subcommand' subcmds
                 fi
                 ;;
             base)
