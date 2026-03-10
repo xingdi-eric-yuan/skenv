@@ -1,0 +1,1483 @@
+#!/usr/bin/env bash
+#
+# skenv — virtualenv-style skill environment manager for Claude Code & Copilot CLI
+#
+# Usage: skenv <command> [arguments]
+#
+# Run `skenv help` for full command listing, or see README.md.
+#
+
+set -euo pipefail
+
+# --- Configuration ---
+
+SKENV_HOME="${SKENV_HOME:-$HOME/.skenv}"
+ACTIVE_FILE="$SKENV_HOME/.active"
+BASE_DIR="$SKENV_HOME/.base"
+REGISTRY_FILE="$SKENV_HOME/.registry"
+PRE_SKENV="_pre-skenv"
+
+# Skill directories to sync — supports both Claude Code and Copilot CLI
+SKILLS_DIRS=(
+    "$HOME/.claude/skills"
+    "$HOME/.copilot/skills"
+)
+
+# --- Colors ---
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- Output helpers ---
+
+_info()  { echo -e "${GREEN}✓${NC} $*"; }
+_warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+_error() { echo -e "${RED}✗${NC} $*" >&2; }
+_hint()  { echo -e "  ${CYAN}→${NC} $*"; }
+
+# --- Path and state helpers ---
+
+_ensure_home() {
+    mkdir -p "$SKENV_HOME"
+}
+
+_get_active() {
+    if [[ -f "$ACTIVE_FILE" ]]; then
+        cat "$ACTIVE_FILE"
+    else
+        echo ""
+    fi
+}
+
+_require_active() {
+    local active
+    active=$(_get_active)
+    if [[ -z "$active" ]]; then
+        _error "No active skill environment."
+        _hint "Run: skenv activate <name>"
+        exit 1
+    fi
+    echo "$active"
+}
+
+_env_dir() {
+    echo "$SKENV_HOME/$1"
+}
+
+_require_env_exists() {
+    local env_dir
+    env_dir=$(_env_dir "$1")
+    if [[ ! -d "$env_dir" ]]; then
+        _error "Environment '$1' does not exist."
+        _hint "Run: skenv create $1"
+        exit 1
+    fi
+}
+
+# --- Skill metadata tracking ---
+#
+# Each installed skill gets a .skenv-meta file recording its source path,
+# install timestamp, install mode (copy/link), and a content hash.
+# For symlinked skills, meta is stored alongside as <name>.skenv-meta.
+
+_write_meta() {
+    local skill_dir="$1"
+    local source_path="$2"
+    local install_mode="${3:-copy}"
+
+    local meta_file
+    if [[ -L "$skill_dir" ]]; then
+        meta_file="${skill_dir}.skenv-meta"
+    else
+        meta_file="$skill_dir/.skenv-meta"
+    fi
+
+    local hash=""
+    if [[ -d "$source_path" ]]; then
+        hash=$(find "$source_path" -type f -exec cat {} + 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
+    fi
+
+    cat > "$meta_file" <<EOF
+source=$source_path
+installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mode=$install_mode
+hash=$hash
+EOF
+}
+
+_read_meta() {
+    local skill_dir="$1"
+    local key="$2"
+    local meta_file
+
+    if [[ -L "$skill_dir" ]]; then
+        meta_file="${skill_dir}.skenv-meta"
+    else
+        meta_file="$skill_dir/.skenv-meta"
+    fi
+
+    if [[ -f "$meta_file" ]]; then
+        grep "^${key}=" "$meta_file" 2>/dev/null | cut -d= -f2-
+    fi
+}
+
+_read_meta_summary() {
+    local skill_dir="$1"
+    local source
+    source=$(_read_meta "$skill_dir" "source")
+    if [[ -n "$source" ]]; then
+        echo -e " ${YELLOW}← ${source}${NC}"
+    fi
+}
+
+_is_skill_outdated() {
+    local skill_dir="$1"
+    local stored_hash source current_hash
+    stored_hash=$(_read_meta "$skill_dir" "hash")
+    source=$(_read_meta "$skill_dir" "source")
+
+    [[ -z "$stored_hash" || -z "$source" || ! -d "$source" ]] && return 1
+
+    current_hash=$(find "$source" -type f -exec cat {} + 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
+    [[ "$stored_hash" != "$current_hash" ]]
+}
+
+# --- Core engine ---
+#
+# These functions implement the central mechanism: wiping skill directories
+# and re-symlinking from the active environment, respecting the layering
+# order: base -> parent envs -> active env.
+
+_wipe_skills_dir() {
+    local skills_dir="$1"
+    if [[ -d "$skills_dir" ]]; then
+        find "$skills_dir" -maxdepth 1 -mindepth 1 \( -type l -o -type d \) -exec rm -rf {} +
+    fi
+}
+
+_link_skills_from() {
+    # Symlink all skills from a source dir into a target skills dir.
+    # Overwrites existing entries (later layer wins).
+    local src_dir="$1"
+    local target_dir="$2"
+
+    for skill in "$src_dir"/*; do
+        [[ -e "$skill" || -L "$skill" ]] || continue
+        local skill_name
+        skill_name=$(basename "$skill")
+        [[ "$skill_name" == *.skenv-meta || "$skill_name" == .* ]] && continue
+        rm -rf "$target_dir/$skill_name"
+        ln -sf "$skill" "$target_dir/$skill_name"
+    done
+}
+
+_resolve_env_chain() {
+    # Walk the .parent chain for an env, returning parent-first order.
+    # The env itself is appended last (highest priority). Detects cycles.
+    local env_name="$1"
+    local -a chain=()
+    local -a visited=()
+    local current="$env_name"
+
+    while [[ -n "$current" ]]; do
+        for v in "${visited[@]+"${visited[@]}"}"; do
+            if [[ "$v" == "$current" ]]; then
+                _error "Inheritance cycle detected involving '$current'."
+                exit 1
+            fi
+        done
+        visited+=("$current")
+
+        local parent_file="$(_env_dir "$current")/.parent"
+        if [[ -f "$parent_file" ]]; then
+            local parent
+            parent=$(cat "$parent_file")
+            if [[ -n "$parent" && -d "$(_env_dir "$parent")" ]]; then
+                chain=("$parent" "${chain[@]+"${chain[@]}"}")
+                current="$parent"
+            else
+                current=""
+            fi
+        else
+            current=""
+        fi
+    done
+
+    chain+=("$env_name")
+    # Use pipe delimiter to handle env names safely
+    local IFS='|'
+    echo "${chain[*]}"
+}
+
+_sync_skills() {
+    # Clean wipe-and-replace: true venv-style isolation.
+    # Layering: base -> parent envs (if inherited) -> active env.
+    local env_name="$1"
+
+    local chain_str
+    chain_str=$(_resolve_env_chain "$env_name")
+    local -a chain=()
+    IFS='|' read -ra chain <<< "$chain_str"
+
+    for skills_dir in "${SKILLS_DIRS[@]}"; do
+        mkdir -p "$skills_dir"
+        _wipe_skills_dir "$skills_dir"
+
+        # Base layer (always present)
+        if [[ -d "$BASE_DIR" ]]; then
+            _link_skills_from "$BASE_DIR" "$skills_dir"
+        fi
+
+        # Inheritance chain (parent first, child last = child wins)
+        for link_env in "${chain[@]}"; do
+            local link_dir
+            link_dir=$(_env_dir "$link_env")
+            if [[ -d "$link_dir" ]]; then
+                _link_skills_from "$link_dir" "$skills_dir"
+            fi
+        done
+    done
+}
+
+_auto_import() {
+    local skip_confirm="${1:-0}"
+    local target_env="${2:-}"
+    # On first use, snapshot existing skills into _pre-skenv.
+    # Preserves symlinks as symlinks so external references stay linked.
+    local pre_dir
+    pre_dir=$(_env_dir "$PRE_SKENV")
+    [[ -d "$pre_dir" ]] && return 0
+
+    # Check if there are existing skills to protect
+    local has_skills=0
+    for skills_dir in "${SKILLS_DIRS[@]}"; do
+        if [[ -d "$skills_dir" ]] && [[ -n "$(ls -A "$skills_dir" 2>/dev/null)" ]]; then
+            has_skills=1
+            break
+        fi
+    done
+
+    if [[ $has_skills -eq 1 ]] && [[ "$skip_confirm" -ne 1 ]] && [[ "${SKENV_YES:-}" != "1" ]]; then
+        echo ""
+        _warn "${BOLD}First-time setup — please read carefully.${NC}"
+        echo ""
+        echo -e "  skenv will manage these skill directories:"
+        for skills_dir in "${SKILLS_DIRS[@]}"; do
+            local count=0
+            [[ -d "$skills_dir" ]] && count=$(find "$skills_dir" -maxdepth 1 -mindepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')
+            echo -e "    ${CYAN}$skills_dir${NC}  ($count skills)"
+        done
+        echo ""
+        echo -e "  On activate, skenv ${RED}replaces all contents${NC} of these directories"
+        echo -e "  with symlinks to the active environment."
+        echo ""
+        echo -e "  skenv will snapshot your current skills into a ${BOLD}_pre-skenv${NC} environment,"
+        echo -e "  but we strongly recommend you back them up yourself first."
+        echo ""
+        echo -n -e "  ${BOLD}Have you backed up your skills? [y/N]${NC} "
+
+        local answer
+        read -r answer
+        case "$answer" in
+            [yY]|[yY][eE][sS])
+                ;;
+            *)
+                _error "Aborting. Please back up your skills first, then try again."
+                _hint "Example: cp -r ~/.claude/skills ~/skills-backup"
+                exit 1
+                ;;
+        esac
+    fi
+
+    local imported=0
+    mkdir -p "$pre_dir"
+
+    for skills_dir in "${SKILLS_DIRS[@]}"; do
+        [[ -d "$skills_dir" ]] || continue
+        for item in "$skills_dir"/*; do
+            [[ -e "$item" || -L "$item" ]] || continue
+            local name
+            name=$(basename "$item")
+            [[ -e "$pre_dir/$name" || -L "$pre_dir/$name" ]] && continue
+
+            if [[ -L "$item" ]]; then
+                local target
+                target=$(readlink "$item")
+                # Resolve relative symlinks to absolute paths
+                if [[ "$target" != /* ]]; then
+                    target="$(cd "$(dirname "$item")" && cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+                fi
+                ln -s "$target" "$pre_dir/$name"
+            else
+                cp -r "$item" "$pre_dir/$name"
+            fi
+            imported=$((imported + 1))
+        done
+    done
+
+    if [[ $imported -gt 0 ]]; then
+        _info "Imported $imported existing skill(s) into ${BOLD}$PRE_SKENV${NC} environment."
+        _hint "Run 'skenv activate $PRE_SKENV' anytime to restore your original skills."
+
+        # Offer to copy existing skills into the target environment
+        if [[ -n "$target_env" ]] && [[ "$target_env" != "$PRE_SKENV" ]]; then
+            local target_dir
+            target_dir=$(_env_dir "$target_env")
+            local do_import=0
+            if [[ "$skip_confirm" -eq 1 ]] || [[ "${SKENV_YES:-}" == "1" ]]; then
+                : # non-interactive mode: don't import unless explicitly asked
+            else
+                echo ""
+                echo -n -e "  ${BOLD}Import these skills into '$target_env'? [y/N]${NC} "
+                local import_answer
+                read -r import_answer
+                case "$import_answer" in
+                    [yY]|[yY][eE][sS]) do_import=1 ;;
+                esac
+            fi
+            if [[ $do_import -eq 1 ]]; then
+                for item in "$pre_dir"/*; do
+                    [[ -e "$item" || -L "$item" ]] || continue
+                    local skill_name
+                    skill_name=$(basename "$item")
+                    [[ "$skill_name" == *.skenv-meta ]] && continue
+                    [[ "$skill_name" == .* ]] && continue
+                    # Skip if target already has this skill
+                    [[ -e "$target_dir/$skill_name" || -L "$target_dir/$skill_name" ]] && continue
+                    if [[ -L "$item" ]]; then
+                        local link_target
+                        link_target=$(readlink "$item")
+                        ln -s "$link_target" "$target_dir/$skill_name"
+                    else
+                        cp -r "$item" "$target_dir/$skill_name"
+                    fi
+                done
+                _info "Copied $imported skill(s) into ${BOLD}$target_env${NC}."
+            fi
+        fi
+    fi
+}
+
+# --- Environment lifecycle commands ---
+
+cmd_create() {
+    local name=""
+    local from_env=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) from_env="${2:?--from requires an environment name}"; shift 2 ;;
+            -*) _error "Unknown flag: $1"; exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"; shift
+                else
+                    _error "Unexpected argument: $1"; exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        _error "Usage: skenv create <name> [--from <env>]"
+        exit 1
+    fi
+
+    if [[ "$name" == _* ]]; then
+        _error "Environment names starting with '_' are reserved for skenv internals."
+        exit 1
+    fi
+
+    if [[ "$name" =~ [[:space:]] ]]; then
+        _error "Environment names cannot contain whitespace."
+        exit 1
+    fi
+
+    _ensure_home
+    local env_dir
+    env_dir=$(_env_dir "$name")
+
+    if [[ -d "$env_dir" ]]; then
+        _error "Environment '$name' already exists."
+        exit 1
+    fi
+
+    if [[ -n "$from_env" ]]; then
+        _require_env_exists "$from_env"
+        local src_dir
+        src_dir=$(_env_dir "$from_env")
+        cp -r "$src_dir" "$env_dir"
+        # Remove metadata files from the copy
+        find "$env_dir" -maxdepth 1 -name '*.skenv-meta' -delete 2>/dev/null
+        find "$env_dir" -maxdepth 2 -name '.skenv-meta' -delete 2>/dev/null
+        local count
+        count=$(find "$env_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        _info "Created ${BOLD}$name${NC} from ${BOLD}$from_env${NC} ($count skill(s) copied)"
+    else
+        mkdir -p "$env_dir"
+        _info "Created skill environment: ${BOLD}$name${NC}"
+    fi
+    _hint "Activate it with: skenv activate $name"
+}
+
+cmd_activate() {
+    local yes_flag=0
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -y|--yes) yes_flag=1; shift ;;
+            *) _error "Unknown flag: $1"; exit 1 ;;
+        esac
+    done
+    local name="${1:?Usage: skenv activate [-y|--yes] <name>}"
+    _ensure_home
+    _require_env_exists "$name"
+
+    local current
+    current=$(_get_active)
+
+    if [[ "$current" == "$name" ]]; then
+        _warn "Environment '$name' is already active."
+        return 0
+    fi
+
+    _auto_import "$yes_flag" "$name"
+
+    if [[ -n "$current" ]]; then
+        _warn "Switching from: $current"
+    fi
+
+    echo "$name" > "$ACTIVE_FILE"
+    _sync_skills "$name"
+
+    local count
+    count=$(find "$(_env_dir "$name")" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    local dirs_list
+    dirs_list=$(printf '%s' "${SKILLS_DIRS[*]// /, }")
+    _info "Activated ${BOLD}$name${NC} ($count skill(s) linked to $dirs_list)"
+}
+
+cmd_deactivate() {
+    local current
+    current=$(_get_active)
+
+    if [[ -z "$current" ]]; then
+        _warn "No active environment to deactivate."
+        return 0
+    fi
+
+    for skills_dir in "${SKILLS_DIRS[@]}"; do
+        _wipe_skills_dir "$skills_dir"
+    done
+
+    rm -f "$ACTIVE_FILE"
+    _info "Deactivated environment: ${BOLD}$current${NC}"
+}
+
+# --- Skill management commands ---
+
+cmd_install() {
+    local skill_path="${1:?Usage: skenv install <skill-path> [--env <name>] [--link]}"
+    shift
+
+    local env_name="" link_mode=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --env)
+                [[ $# -lt 2 ]] && { _error "--env requires an environment name"; exit 1; }
+                env_name="$2"; shift 2 ;;
+            --link) link_mode=1; shift ;;
+            *) _error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$env_name" ]]; then
+        env_name=$(_require_active)
+    fi
+    _require_env_exists "$env_name"
+
+    skill_path=$(realpath "$skill_path" 2>/dev/null || echo "$skill_path")
+
+    if [[ ! -d "$skill_path" ]]; then
+        _error "Skill path '$skill_path' is not a directory."
+        _hint "A skill should be a directory containing a SKILL.md file."
+        exit 1
+    fi
+
+    if [[ ! -f "$skill_path/SKILL.md" ]]; then
+        _warn "No SKILL.md found in '$skill_path'. Installing anyway."
+    fi
+
+    local skill_name
+    skill_name=$(basename "$skill_path")
+    local env_dir
+    env_dir=$(_env_dir "$env_name")
+    local dest="$env_dir/$skill_name"
+
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        _warn "Skill '$skill_name' already exists in '$env_name'. Replacing."
+        rm -rf "$dest"
+        rm -f "${dest}.skenv-meta"
+    fi
+
+    if [[ $link_mode -eq 1 ]]; then
+        ln -sf "$skill_path" "$dest"
+        _write_meta "$dest" "$skill_path" "link"
+        _info "Linked ${BOLD}$skill_name${NC} into ${BOLD}$env_name${NC} (→ $skill_path)"
+    else
+        cp -r "$skill_path" "$dest"
+        _write_meta "$dest" "$skill_path" "copy"
+        _info "Installed ${BOLD}$skill_name${NC} into ${BOLD}$env_name${NC}"
+    fi
+
+    local current
+    current=$(_get_active)
+    if [[ "$current" == "$env_name" ]]; then
+        _sync_skills "$env_name"
+        _hint "Active environment updated."
+    fi
+}
+
+cmd_uninstall() {
+    local skill_name="${1:?Usage: skenv uninstall <skill-name> [--env <name>]}"
+    shift
+
+    local env_name=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --env)
+                [[ $# -lt 2 ]] && { _error "--env requires an environment name"; exit 1; }
+                env_name="$2"; shift 2 ;;
+            *) _error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$env_name" ]]; then
+        env_name=$(_require_active)
+    fi
+    _require_env_exists "$env_name"
+
+    local env_dir
+    env_dir=$(_env_dir "$env_name")
+    local target="$env_dir/$skill_name"
+
+    if [[ ! -e "$target" ]]; then
+        _error "Skill '$skill_name' not found in environment '$env_name'."
+        exit 1
+    fi
+
+    rm -rf "$target"
+    rm -f "${target}.skenv-meta"
+    _info "Uninstalled ${BOLD}$skill_name${NC} from ${BOLD}$env_name${NC}"
+
+    local current
+    current=$(_get_active)
+    if [[ "$current" == "$env_name" ]]; then
+        _sync_skills "$env_name"
+        _hint "Active environment updated."
+    fi
+}
+
+# --- Listing and status commands ---
+
+cmd_list() {
+    _ensure_home
+    local current
+    current=$(_get_active)
+
+    local found=0
+    for env_dir in "$SKENV_HOME"/*/; do
+        [[ -d "$env_dir" ]] || continue
+        found=1
+        local name
+        name=$(basename "$env_dir")
+        local count
+        count=$(find "$env_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+
+        if [[ "$name" == "$current" ]]; then
+            echo -e "  ${GREEN}*${NC} ${BOLD}$name${NC}  ($count skills)"
+        else
+            echo -e "    $name  ($count skills)"
+        fi
+    done
+
+    if [[ $found -eq 0 ]]; then
+        _warn "No skill environments found."
+        _hint "Run: skenv create <name>"
+    fi
+}
+
+cmd_ls() {
+    local env_name="${1:-}"
+
+    if [[ -z "$env_name" ]]; then
+        env_name=$(_require_active)
+    fi
+    _require_env_exists "$env_name"
+
+    local env_dir
+    env_dir=$(_env_dir "$env_name")
+
+    local parent_file="$env_dir/.parent"
+    if [[ -f "$parent_file" ]]; then
+        echo -e "${BOLD}Skills in '$env_name'${NC} ${CYAN}(inherits from: $(cat "$parent_file"))${NC}${BOLD}:${NC}"
+    else
+        echo -e "${BOLD}Skills in '$env_name':${NC}"
+    fi
+
+    local found=0
+    for skill in "$env_dir"/*; do
+        [[ -e "$skill" || -L "$skill" ]] || continue
+        local skill_name
+        skill_name=$(basename "$skill")
+        [[ "$skill_name" == ".parent" || "$skill_name" == .* || "$skill_name" == *.skenv-meta ]] && continue
+        found=1
+
+        local mode_tag=""
+        local mode
+        mode=$(_read_meta "$skill" "mode")
+        [[ "$mode" == "link" ]] && mode_tag=" ${CYAN}(linked)${NC}"
+
+        local outdated_tag=""
+        if _is_skill_outdated "$skill"; then
+            outdated_tag=" ${RED}(outdated)${NC}"
+        fi
+
+        local meta_line=""
+        meta_line=$(_read_meta_summary "$skill")
+
+        local skill_resolved="$skill"
+        [[ -L "$skill" ]] && skill_resolved=$(readlink -f "$skill" 2>/dev/null || echo "$skill")
+
+        if [[ -f "$skill_resolved/SKILL.md" ]]; then
+            local desc
+            desc=$(sed -n '/^---$/,/^---$/{ /^description:/s/^description: *//p; }' "$skill_resolved/SKILL.md" 2>/dev/null | head -1)
+            if [[ -n "$desc" ]]; then
+                if [[ ${#desc} -gt 72 ]]; then
+                    desc="${desc:0:69}..."
+                fi
+                echo -e "  ${BLUE}•${NC} ${BOLD}$skill_name${NC}${mode_tag}${outdated_tag}"
+                echo -e "    ${desc}"
+            else
+                echo -e "  ${BLUE}•${NC} ${BOLD}$skill_name${NC}${mode_tag}${outdated_tag}"
+            fi
+        else
+            echo -e "  ${BLUE}•${NC} $skill_name ${YELLOW}(no SKILL.md)${NC}${mode_tag}${outdated_tag}"
+        fi
+    done
+
+    if [[ $found -eq 0 ]]; then
+        _warn "No skills installed."
+        _hint "Run: skenv install <skill-path>"
+    fi
+}
+
+cmd_status() {
+    local current
+    current=$(_get_active)
+
+    if [[ -z "$current" ]]; then
+        echo -e "No active skill environment."
+    else
+        local count
+        count=$(find "$(_env_dir "$current")" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        echo -e "Active environment: ${BOLD}${GREEN}$current${NC} ($count skills)"
+    fi
+}
+
+cmd_delete() {
+    local name="${1:?Usage: skenv delete <name>}"
+
+    local name_lower
+    name_lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    local pre_lower
+    pre_lower=$(echo "$PRE_SKENV" | tr '[:upper:]' '[:lower:]')
+    if [[ "$name_lower" == "$pre_lower" ]]; then
+        _error "Cannot delete '$PRE_SKENV' — it contains your original skills backup."
+        _hint "Use 'skenv clone $PRE_SKENV <name>' to copy it, or force with: rm -rf \$SKENV_HOME/$PRE_SKENV"
+        exit 1
+    fi
+
+    _require_env_exists "$name"
+
+    local current
+    current=$(_get_active)
+
+    if [[ "$current" == "$name" ]]; then
+        _warn "Deactivating '$name' before deletion."
+        cmd_deactivate
+    fi
+
+    rm -rf "$(_env_dir "$name")"
+    _info "Deleted environment: ${BOLD}$name${NC}"
+}
+
+cmd_clone() {
+    local src="${1:?Usage: skenv clone <source> <destination>}"
+    local dst="${2:?Usage: skenv clone <source> <destination>}"
+
+    _require_env_exists "$src"
+    _ensure_home
+
+    local dst_dir
+    dst_dir=$(_env_dir "$dst")
+    if [[ -d "$dst_dir" ]]; then
+        _error "Environment '$dst' already exists."
+        exit 1
+    fi
+
+    cp -r "$(_env_dir "$src")" "$dst_dir"
+    _info "Cloned ${BOLD}$src${NC} → ${BOLD}$dst${NC}"
+}
+
+# --- Base layer ---
+
+cmd_base() {
+    local subcmd="${1:?Usage: skenv base install <path> | uninstall <name> | ls}"
+    shift
+
+    case "$subcmd" in
+        install)
+            local skill_path="${1:?Usage: skenv base install <skill-path>}"
+            shift
+            local link_mode=0
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --link) link_mode=1; shift ;;
+                    *) _error "Unknown option: $1"; exit 1 ;;
+                esac
+            done
+
+            skill_path=$(realpath "$skill_path" 2>/dev/null || echo "$skill_path")
+            if [[ ! -d "$skill_path" ]]; then
+                _error "Skill path '$skill_path' is not a directory."
+                exit 1
+            fi
+
+            mkdir -p "$BASE_DIR"
+            local skill_name
+            skill_name=$(basename "$skill_path")
+            local dest="$BASE_DIR/$skill_name"
+
+            if [[ -e "$dest" ]]; then
+                _warn "Base skill '$skill_name' already exists. Replacing."
+                rm -rf "$dest"
+            fi
+
+            if [[ $link_mode -eq 1 ]]; then
+                ln -sf "$skill_path" "$dest"
+                _write_meta "$dest" "$skill_path" "link"
+            else
+                cp -r "$skill_path" "$dest"
+                _write_meta "$dest" "$skill_path" "copy"
+            fi
+            _info "Installed ${BOLD}$skill_name${NC} into ${BOLD}base layer${NC}"
+
+            local current
+            current=$(_get_active)
+            if [[ -n "$current" ]]; then
+                _sync_skills "$current"
+                _hint "Active environment updated."
+            fi
+            ;;
+        uninstall)
+            local skill_name="${1:?Usage: skenv base uninstall <skill-name>}"
+            local target="$BASE_DIR/$skill_name"
+            if [[ ! -e "$target" && ! -L "$target" ]]; then
+                _error "Skill '$skill_name' not found in base layer."
+                exit 1
+            fi
+            rm -rf "$target"
+            _info "Uninstalled ${BOLD}$skill_name${NC} from ${BOLD}base layer${NC}"
+
+            local current
+            current=$(_get_active)
+            if [[ -n "$current" ]]; then
+                _sync_skills "$current"
+                _hint "Active environment updated."
+            fi
+            ;;
+        ls)
+            echo -e "${BOLD}Base layer skills (always active):${NC}"
+            if [[ ! -d "$BASE_DIR" ]] || [[ -z "$(ls -A "$BASE_DIR" 2>/dev/null)" ]]; then
+                _warn "No base skills installed."
+                _hint "Run: skenv base install <skill-path>"
+                return 0
+            fi
+            for skill in "$BASE_DIR"/*; do
+                [[ -e "$skill" || -L "$skill" ]] || continue
+                local skill_name
+                skill_name=$(basename "$skill")
+                [[ "$skill_name" == .* || "$skill_name" == *.skenv-meta ]] && continue
+                local meta_line=""
+                meta_line=$(_read_meta_summary "$skill")
+                if [[ -L "$skill" ]]; then
+                    echo -e "  ${BLUE}•${NC} ${BOLD}$skill_name${NC} ${CYAN}(linked)${NC}${meta_line}"
+                else
+                    echo -e "  ${BLUE}•${NC} ${BOLD}$skill_name${NC}${meta_line}"
+                fi
+            done
+            ;;
+        *)
+            _error "Unknown base subcommand: $subcmd"
+            _hint "Usage: skenv base install <path> | uninstall <name> | ls"
+            exit 1
+            ;;
+    esac
+}
+
+# --- Diff ---
+
+cmd_diff() {
+    local env_a="${1:?Usage: skenv diff <env-a> <env-b>}"
+    local env_b="${2:?Usage: skenv diff <env-a> <env-b>}"
+    _require_env_exists "$env_a"
+    _require_env_exists "$env_b"
+
+    local dir_a dir_b
+    dir_a=$(_env_dir "$env_a")
+    dir_b=$(_env_dir "$env_b")
+
+    local -a skills_a=() skills_b=()
+    for s in "$dir_a"/*; do
+        [[ -e "$s" || -L "$s" ]] || continue
+        local bn; bn=$(basename "$s")
+        [[ "$bn" == .* || "$bn" == *.skenv-meta ]] && continue
+        skills_a+=("$bn")
+    done
+    for s in "$dir_b"/*; do
+        [[ -e "$s" || -L "$s" ]] || continue
+        local bn; bn=$(basename "$s")
+        [[ "$bn" == .* || "$bn" == *.skenv-meta ]] && continue
+        skills_b+=("$bn")
+    done
+
+    local only_a=() only_b=() common=()
+    for s in "${skills_a[@]+"${skills_a[@]}"}"; do
+        if printf '%s\n' "${skills_b[@]+"${skills_b[@]}"}" | grep -qxF "$s"; then
+            common+=("$s")
+        else
+            only_a+=("$s")
+        fi
+    done
+    for s in "${skills_b[@]+"${skills_b[@]}"}"; do
+        printf '%s\n' "${skills_a[@]+"${skills_a[@]}"}" | grep -qxF "$s" || only_b+=("$s")
+    done
+
+    echo -e "${BOLD}Diff: $env_a ↔ $env_b${NC}"
+    echo ""
+    if [[ ${#only_a[@]} -gt 0 ]]; then
+        echo -e "  ${RED}Only in $env_a:${NC}"
+        for s in "${only_a[@]}"; do echo -e "    ${RED}-${NC} $s"; done
+    fi
+    if [[ ${#only_b[@]} -gt 0 ]]; then
+        echo -e "  ${GREEN}Only in $env_b:${NC}"
+        for s in "${only_b[@]}"; do echo -e "    ${GREEN}+${NC} $s"; done
+    fi
+    if [[ ${#common[@]} -gt 0 ]]; then
+        echo -e "  ${BLUE}Common:${NC}"
+        for s in "${common[@]}"; do echo -e "    ${BLUE}=${NC} $s"; done
+    fi
+    if [[ ${#only_a[@]} -eq 0 && ${#only_b[@]} -eq 0 ]]; then
+        _info "Environments are identical."
+    fi
+}
+
+# --- Freeze / Init ---
+
+cmd_freeze() {
+    local env_name="${1:-}"
+    if [[ -z "$env_name" ]]; then
+        env_name=$(_require_active)
+    fi
+    _require_env_exists "$env_name"
+
+    local env_dir
+    env_dir=$(_env_dir "$env_name")
+
+    echo "# skenv manifest for: $env_name"
+    echo "# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo ""
+
+    for skill in "$env_dir"/*; do
+        [[ -e "$skill" || -L "$skill" ]] || continue
+        local skill_name source mode
+        skill_name=$(basename "$skill")
+        [[ "$skill_name" == .* || "$skill_name" == *.skenv-meta ]] && continue
+        source=$(_read_meta "$skill" "source")
+        mode=$(_read_meta "$skill" "mode")
+
+        if [[ -n "$source" ]]; then
+            echo "${skill_name}|${source}|${mode:-copy}"
+        else
+            echo "${skill_name}||copy"
+        fi
+    done
+
+    if [[ -d "$BASE_DIR" ]]; then
+        for skill in "$BASE_DIR"/*; do
+            [[ -e "$skill" || -L "$skill" ]] || continue
+            local skill_name source mode
+            skill_name=$(basename "$skill")
+            [[ "$skill_name" == .* || "$skill_name" == *.skenv-meta ]] && continue
+            source=$(_read_meta "$skill" "source")
+            mode=$(_read_meta "$skill" "mode")
+            echo "@base:${skill_name}|${source:-}|${mode:-copy}"
+        done
+    fi
+}
+
+cmd_init() {
+    local name="${1:?Usage: skenv init <name> --from <manifest>}"
+    shift
+
+    local manifest=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) manifest="$2"; shift 2 ;;
+            *) _error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$manifest" ]]; then
+        _error "No manifest specified."
+        _hint "Usage: skenv init <name> --from <manifest-file>"
+        exit 1
+    fi
+
+    if [[ ! -f "$manifest" ]]; then
+        _error "Manifest file '$manifest' not found."
+        exit 1
+    fi
+
+    cmd_create "$name"
+
+    local env_dir
+    env_dir=$(_env_dir "$name")
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+
+        local is_base=0
+        if [[ "$line" == @base:* ]]; then
+            is_base=1
+            line="${line#@base:}"
+        fi
+
+        IFS='|' read -r skill_name source mode <<< "$line"
+
+        if [[ -z "$source" || ! -d "$source" ]]; then
+            _warn "Skipping '$skill_name' — source not found: ${source:-<none>}"
+            continue
+        fi
+
+        local dest
+        if [[ $is_base -eq 1 ]]; then
+            mkdir -p "$BASE_DIR"
+            dest="$BASE_DIR/$skill_name"
+        else
+            dest="$env_dir/$skill_name"
+        fi
+
+        if [[ "$mode" == "link" ]]; then
+            ln -sf "$source" "$dest"
+        else
+            cp -r "$source" "$dest"
+        fi
+        _write_meta "$dest" "$source" "$mode"
+
+        local target_label="$name"
+        [[ $is_base -eq 1 ]] && target_label="base"
+        _info "Restored ${BOLD}$skill_name${NC} into ${BOLD}$target_label${NC}"
+    done < "$manifest"
+}
+
+# --- Inheritance ---
+
+cmd_inherit() {
+    local child="${1:?Usage: skenv inherit <child-env> <parent-env>}"
+    local parent="${2:?Usage: skenv inherit <child-env> <parent-env>}"
+    _require_env_exists "$child"
+    _require_env_exists "$parent"
+
+    if [[ "$child" == "$parent" ]]; then
+        _error "An environment cannot inherit from itself."
+        exit 1
+    fi
+
+    # Validate no cycles BEFORE writing .parent
+    local parent_file="$(_env_dir "$child")/.parent"
+    local old_parent=""
+    [[ -f "$parent_file" ]] && old_parent=$(cat "$parent_file")
+
+    echo "$parent" > "$parent_file"
+    # Test the chain — _resolve_env_chain exits 1 on cycle (runs in subshell)
+    local chain_test=""
+    chain_test=$(_resolve_env_chain "$child" 2>/dev/null) || {
+        # Restore old state on cycle detection
+        if [[ -n "$old_parent" ]]; then
+            echo "$old_parent" > "$parent_file"
+        else
+            rm -f "$parent_file"
+        fi
+        _error "Inheritance cycle detected: $child → $parent creates a loop."
+        exit 1
+    }
+
+    _info "${BOLD}$child${NC} now inherits from ${BOLD}$parent${NC}"
+
+    local current
+    current=$(_get_active)
+    if [[ "$current" == "$child" ]]; then
+        _sync_skills "$child"
+        _hint "Active environment updated."
+    fi
+}
+
+# --- Run with temporary env ---
+
+cmd_run() {
+    local env_name="${1:?Usage: skenv run <env> -- <command...>}"
+    shift
+    _require_env_exists "$env_name"
+
+    if [[ "${1:-}" != "--" ]]; then
+        _error "Expected '--' before command."
+        _hint "Usage: skenv run <env> -- <command...>"
+        exit 1
+    fi
+    shift
+
+    if [[ $# -eq 0 ]]; then
+        _error "No command specified."
+        exit 1
+    fi
+
+    local previous
+    previous=$(_get_active)
+
+    _ensure_home
+
+    # Trap to restore state on signals
+    _cmd_run_restore() {
+        if [[ -n "$previous" ]]; then
+            echo "$previous" > "$ACTIVE_FILE"
+            _sync_skills "$previous"
+        else
+            rm -f "$ACTIVE_FILE"
+            for skills_dir in "${SKILLS_DIRS[@]}"; do
+                _wipe_skills_dir "$skills_dir"
+            done
+        fi
+    }
+    trap _cmd_run_restore EXIT
+
+    echo "$env_name" > "$ACTIVE_FILE"
+    _sync_skills "$env_name"
+
+    local exit_code=0
+    "$@" || exit_code=$?
+
+    _cmd_run_restore
+    trap - EXIT
+
+    return $exit_code
+}
+
+# --- Skill registry ---
+
+cmd_registry() {
+    local subcmd="${1:?Usage: skenv registry add <name> <path> | remove <name> | list}"
+    shift
+
+    case "$subcmd" in
+        add)
+            local name="${1:?Usage: skenv registry add <name> <path>}"
+            local path="${2:?Usage: skenv registry add <name> <path>}"
+            path=$(realpath "$path")
+            if [[ ! -d "$path" ]]; then
+                _error "Path '$path' is not a directory."
+                exit 1
+            fi
+            _ensure_home
+            if [[ -f "$REGISTRY_FILE" ]]; then
+                awk -F'|' -v n="$name" '$1 != n' "$REGISTRY_FILE" > "$REGISTRY_FILE.tmp" || true
+                mv "$REGISTRY_FILE.tmp" "$REGISTRY_FILE"
+            fi
+            echo "${name}|${path}" >> "$REGISTRY_FILE"
+            _info "Registered ${BOLD}$name${NC} → $path"
+            ;;
+        remove)
+            local name="${1:?Usage: skenv registry remove <name>}"
+            if [[ ! -f "$REGISTRY_FILE" ]]; then
+                _error "Registry is empty."
+                exit 1
+            fi
+            if ! awk -F'|' -v n="$name" '$1 == n { found=1 } END { exit !found }' "$REGISTRY_FILE"; then
+                _error "Skill '$name' not found in registry."
+                exit 1
+            fi
+            awk -F'|' -v n="$name" '$1 != n' "$REGISTRY_FILE" > "$REGISTRY_FILE.tmp" || true
+            mv "$REGISTRY_FILE.tmp" "$REGISTRY_FILE"
+            _info "Removed ${BOLD}$name${NC} from registry."
+            ;;
+        list)
+            if [[ ! -f "$REGISTRY_FILE" || ! -s "$REGISTRY_FILE" ]]; then
+                _warn "Registry is empty."
+                _hint "Run: skenv registry add <name> <path>"
+                return 0
+            fi
+            echo -e "${BOLD}Skill registry:${NC}"
+            while IFS='|' read -r name path; do
+                if [[ -d "$path" ]]; then
+                    echo -e "  ${BLUE}•${NC} ${BOLD}$name${NC} → $path"
+                else
+                    echo -e "  ${BLUE}•${NC} ${BOLD}$name${NC} → $path ${RED}(missing)${NC}"
+                fi
+            done < "$REGISTRY_FILE"
+            ;;
+        *)
+            _error "Unknown registry subcommand: $subcmd"
+            _hint "Usage: skenv registry add <name> <path> | remove <name> | list"
+            exit 1
+            ;;
+    esac
+}
+
+_resolve_install_path() {
+    local arg="$1"
+    if [[ -d "$arg" ]]; then
+        echo "$arg"
+        return 0
+    fi
+    if [[ -f "$REGISTRY_FILE" ]]; then
+        local path
+        path=$(awk -F'|' -v n="$arg" '$1 == n { print $2; exit }' "$REGISTRY_FILE" || true)
+        if [[ -n "$path" && -d "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+    fi
+    echo "$arg"
+}
+
+# --- Shell hook (auto-activate + prompt) ---
+
+cmd_hook() {
+    local shell_type="${1:-zsh}"
+    case "$shell_type" in
+        bash|zsh)
+            cat <<'HOOK'
+# skenv shell hook — add to your .bashrc or .zshrc:
+#   eval "$(skenv hook zsh)"  # or bash
+
+_skenv_auto_activate() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/.skenv" ]]; then
+            local env_name
+            env_name=$(cat "$dir/.skenv" | tr -d '[:space:]')
+            local current=""
+            [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && current=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+            if [[ -n "$env_name" && "$env_name" != "$current" ]]; then
+                # Don't retry a failed activation
+                if [[ "${_skenv_last_failed:-}" == "$env_name" ]]; then
+                    return
+                fi
+                if ! skenv activate "$env_name" 2>&1; then
+                    _skenv_last_failed="$env_name"
+                else
+                    _skenv_last_failed=""
+                fi
+            fi
+            return
+        fi
+        dir=$(dirname "$dir")
+    done
+    _skenv_last_failed=""
+}
+
+_skenv_prompt() {
+    local active=""
+    [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && active=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+    if [[ -n "$active" ]]; then
+        echo "[skenv:${active}] "
+    fi
+}
+
+# Auto-activate on directory change
+if [[ -n "$ZSH_VERSION" ]]; then
+    autoload -U add-zsh-hook
+    add-zsh-hook chpwd _skenv_auto_activate
+    # Prompt: add $(_skenv_prompt) to your PROMPT, e.g.:
+    #   PROMPT='$(_skenv_prompt)%~ %# '
+else
+    _skenv_prompt_command() {
+        _skenv_auto_activate
+    }
+    PROMPT_COMMAND="_skenv_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    # Prompt: add $(_skenv_prompt) to your PS1, e.g.:
+    #   PS1='$(_skenv_prompt)\u@\h:\w\$ '
+fi
+
+# Run once on shell startup
+_skenv_auto_activate
+HOOK
+            ;;
+        *)
+            _error "Unsupported shell: $shell_type (use bash or zsh)"
+            exit 1
+            ;;
+    esac
+}
+
+# --- Tab completion ---
+
+cmd_completion() {
+    local shell_type="${1:-zsh}"
+    case "$shell_type" in
+        bash)
+            cat <<'COMP'
+_skenv_completions() {
+    local cur prev commands
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="create activate deactivate install uninstall list ls status clone delete base diff freeze init inherit run registry hook completion help"
+
+    case "$prev" in
+        skenv)
+            COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+            ;;
+        activate|delete|ls|inherit|run)
+            local envs=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/" 2>/dev/null | grep -v '^\.')
+            COMPREPLY=($(compgen -W "$envs" -- "$cur"))
+            ;;
+        clone|diff)
+            local envs=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/" 2>/dev/null | grep -v '^\.')
+            COMPREPLY=($(compgen -W "$envs" -- "$cur"))
+            ;;
+        uninstall)
+            local active=""
+            [[ -f "${SKENV_HOME:-$HOME/.skenv}/.active" ]] && active=$(cat "${SKENV_HOME:-$HOME/.skenv}/.active")
+            if [[ -n "$active" ]]; then
+                local skills=$(ls -1 "${SKENV_HOME:-$HOME/.skenv}/$active/" 2>/dev/null)
+                COMPREPLY=($(compgen -W "$skills" -- "$cur"))
+            fi
+            ;;
+        base)
+            COMPREPLY=($(compgen -W "install uninstall ls" -- "$cur"))
+            ;;
+        registry)
+            COMPREPLY=($(compgen -W "add remove list" -- "$cur"))
+            ;;
+        hook|completion)
+            COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
+            ;;
+        install)
+            COMPREPLY=($(compgen -d -- "$cur"))
+            if [[ -f "${SKENV_HOME:-$HOME/.skenv}/.registry" ]]; then
+                local names=$(cut -d'|' -f1 "${SKENV_HOME:-$HOME/.skenv}/.registry" 2>/dev/null)
+                COMPREPLY+=($(compgen -W "$names" -- "$cur"))
+            fi
+            ;;
+    esac
+}
+complete -F _skenv_completions skenv
+COMP
+            ;;
+        zsh)
+            cat <<'COMP'
+#compdef skenv
+
+_skenv() {
+    local -a commands envs skills
+    commands=(
+        'create:Create a new skill environment'
+        'activate:Activate an environment'
+        'deactivate:Deactivate the current environment'
+        'install:Install a skill into an environment'
+        'uninstall:Remove a skill from an environment'
+        'list:List all environments'
+        'ls:List skills in an environment'
+        'status:Show current active environment'
+        'clone:Clone an environment'
+        'delete:Delete an environment'
+        'base:Manage base layer skills'
+        'diff:Compare two environments'
+        'freeze:Export env as manifest'
+        'init:Create env from manifest'
+        'inherit:Set env inheritance'
+        'run:Run command with temporary env'
+        'registry:Manage skill registry'
+        'hook:Print shell hook'
+        'completion:Print shell completions'
+        'help:Show help'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+    elif (( CURRENT >= 3 )); then
+        local skenv_home="${SKENV_HOME:-$HOME/.skenv}"
+        case "${words[2]}" in
+            activate|delete|ls|inherit|run|diff)
+                envs=($(ls -1 "$skenv_home/" 2>/dev/null | grep -v '^\.'))
+                _describe 'environment' envs
+                ;;
+            clone)
+                envs=($(ls -1 "$skenv_home/" 2>/dev/null | grep -v '^\.'))
+                _describe 'environment' envs
+                ;;
+            uninstall)
+                local active=""
+                [[ -f "$skenv_home/.active" ]] && active=$(cat "$skenv_home/.active")
+                if [[ -n "$active" ]]; then
+                    skills=($(ls -1 "$skenv_home/$active/" 2>/dev/null))
+                    _describe 'skill' skills
+                fi
+                ;;
+            install)
+                _files -/
+                if [[ -f "$skenv_home/.registry" ]]; then
+                    local -a regnames
+                    regnames=($(cut -d'|' -f1 "$skenv_home/.registry" 2>/dev/null))
+                    _describe 'registry skill' regnames
+                fi
+                ;;
+            base)
+                if (( CURRENT == 3 )); then
+                    local -a subcmds=('install' 'uninstall' 'ls')
+                    _describe 'subcommand' subcmds
+                fi
+                ;;
+            registry)
+                if (( CURRENT == 3 )); then
+                    local -a subcmds=('add' 'remove' 'list')
+                    _describe 'subcommand' subcmds
+                fi
+                ;;
+            hook|completion)
+                local -a shells=('bash' 'zsh')
+                _describe 'shell' shells
+                ;;
+        esac
+    fi
+}
+
+_skenv "$@"
+
+compdef _skenv skenv
+COMP
+            ;;
+        *)
+            _error "Unsupported shell: $shell_type (use bash or zsh)"
+            exit 1
+            ;;
+    esac
+}
+
+# --- Help ---
+
+cmd_help() {
+    cat <<'EOF'
+skenv — virtualenv-style skill environment manager for Claude Code & Copilot CLI
+
+USAGE:
+  skenv <command> [arguments]
+
+COMMANDS:
+  create <name> [--from <env>] Create a new skill environment (optionally from existing)
+  activate [-y] <name>      Activate env (clean swap into ~/.claude/skills/ & ~/.copilot/skills/)
+  deactivate                 Deactivate (removes all skills from discovery dirs)
+  install <path> [opts]      Install a skill (--env N, --link)
+  uninstall <name> [opts]    Remove a skill (--env N)
+  list                       List all environments (* = active)
+  ls [name]                  List skills in an environment (default: active)
+  status                     Show current active environment
+  clone <src> <dst>          Clone an environment
+  delete <name>              Delete an environment
+  base install|uninstall|ls  Manage base layer (always-on skills)
+  diff <env-a> <env-b>       Compare two environments
+  freeze [name]              Export env as manifest (pipe to file)
+  init <name> --from <file>  Recreate env from manifest
+  inherit <child> <parent>   Set env inheritance
+  run <env> -- <cmd...>      Run command with temporary env
+  registry add|remove|list   Manage skill registry
+  hook [bash|zsh]            Print shell hook (auto-activate + prompt)
+  completion [bash|zsh]      Print tab completion script
+  help                       Show this help
+
+ENVIRONMENT VARIABLES:
+  SKENV_HOME            Base directory for envs (default: ~/.skenv)
+
+SETUP:
+  # Add to your .zshrc or .bashrc:
+  eval "$(skenv hook zsh)"            # auto-activate + prompt
+  eval "$(skenv completion zsh)"      # tab completion
+
+EXAMPLES:
+  skenv create research
+  skenv activate research
+  skenv install ~/my-skills/zsh-shell
+  skenv install ~/my-skills/python-research --link
+  skenv base install ~/my-skills/always-on-skill
+  skenv ls
+
+  skenv create webdev
+  skenv activate webdev               # clean switch — only webdev skills
+  skenv install react-patterns        # install from registry
+
+  skenv freeze > research.manifest    # export
+  skenv init research-v2 --from research.manifest  # recreate
+
+  skenv inherit research-v2 research  # research-v2 extends research
+  skenv run research -- claude        # temporary activation
+
+  skenv list                          # shows all envs, * marks active
+  skenv diff research webdev          # compare two envs
+EOF
+}
+
+# --- Main dispatch ---
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+    create)     cmd_create "$@" ;;
+    activate)   cmd_activate "$@" ;;
+    deactivate) cmd_deactivate "$@" ;;
+    install)
+        if [[ $# -gt 0 ]]; then
+            resolved=$(_resolve_install_path "$1")
+            shift
+            cmd_install "$resolved" "$@"
+        else
+            cmd_install "$@"
+        fi
+        ;;
+    uninstall)  cmd_uninstall "$@" ;;
+    list)       cmd_list "$@" ;;
+    ls)         cmd_ls "$@" ;;
+    status)     cmd_status "$@" ;;
+    delete)     cmd_delete "$@" ;;
+    clone)      cmd_clone "$@" ;;
+    base)       cmd_base "$@" ;;
+    diff)       cmd_diff "$@" ;;
+    freeze)     cmd_freeze "$@" ;;
+    init)       cmd_init "$@" ;;
+    inherit)    cmd_inherit "$@" ;;
+    run)        cmd_run "$@" ;;
+    registry)   cmd_registry "$@" ;;
+    hook)       cmd_hook "$@" ;;
+    completion) cmd_completion "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        _error "Unknown command: $command"
+        _hint "Run: skenv help"
+        exit 1
+        ;;
+esac
