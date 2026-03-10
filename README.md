@@ -80,18 +80,37 @@ skenv help
 
 ### Shell integration (optional but recommended)
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+Add to your `~/.zshrc` or `~/.bashrc`, **after** oh-my-zsh/framework sourcing:
 
 ```bash
-eval "$(skenv hook zsh)"          # auto-activate + prompt
+eval "$(skenv hook zsh)"          # auto-activate + prompt helper
 eval "$(skenv completion zsh)"    # tab completion
 ```
 
 Replace `zsh` with `bash` if needed. This gives you:
 
 - **Auto-activation:** Put a `.skenv` file in any project directory (containing an env name), and skenv activates it automatically when you `cd` in.
-- **Prompt indicator:** Shows `[skenv:research]` in your prompt when an env is active.
+- **Prompt indicator:** Shows `[skenv:research]` when an env is active.
 - **Tab completion:** Complete commands, environment names, and skill names.
+
+#### Prompt setup
+
+The hook defines a `_skenv_prompt` function but you need to add it to your prompt.
+
+**oh-my-zsh** (add after `source $ZSH/oh-my-zsh.sh`):
+```bash
+PROMPT='$(_skenv_prompt)'"$PROMPT"
+```
+
+**Plain zsh:**
+```bash
+PROMPT='$(_skenv_prompt)%~ %# '
+```
+
+**Bash:**
+```bash
+PS1='$(_skenv_prompt)\u@\h:\w\$ '
+```
 
 ---
 
