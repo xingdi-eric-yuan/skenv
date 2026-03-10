@@ -13,6 +13,7 @@ skenv activate webdev       # now they see webdev skills instead
 
 ```bash
 # 1. Install
+mkdir -p ~/bin
 curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -o ~/bin/skenv
 chmod +x ~/bin/skenv
 
@@ -52,6 +53,7 @@ Claude Code and Copilot CLI discover skills from folders on disk (`~/.claude/ski
 ### Option A: Direct download
 
 ```bash
+mkdir -p ~/bin
 curl -fsSL https://raw.githubusercontent.com/xingdi-eric-yuan/skenv/main/skenv -o ~/bin/skenv
 chmod +x ~/bin/skenv
 ```
