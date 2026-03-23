@@ -1,11 +1,12 @@
 # --- Package installation ---
 #
-# A "package" is a directory containing skills/ and optionally hooks/:
+# A "package" is a directory containing skills/ and optionally hooks/ and agent-context.md:
 #   my-package/
-#   ├── skills/           # each subdirectory is a skill (with SKILL.md)
-#   └── hooks/            # optional: hook configs + scripts
-#       ├── *.json        # hook definitions (platform-specific format)
-#       └── scripts/      # hook scripts referenced by the JSON
+#   ├── skills/            # each subdirectory is a skill (with SKILL.md)
+#   ├── hooks/             # optional: hook configs + scripts
+#   │   ├── *.json         # hook definitions (platform-specific format)
+#   │   └── scripts/       # hook scripts referenced by the JSON
+#   └── agent-context.md   # optional: always-on context injected into project instructions
 
 cmd_install_package() {
     local pkg_path=""
@@ -44,13 +45,14 @@ cmd_install_package() {
     local pkg_name
     pkg_name=$(basename "$pkg_path")
 
-    local has_skills=0 has_hooks=0
+    local has_skills=0 has_hooks=0 has_context=0
     [[ -d "$pkg_path/skills" ]] && has_skills=1
     [[ -d "$pkg_path/hooks" ]] && has_hooks=1
+    [[ -f "$pkg_path/agent-context.md" ]] && has_context=1
 
-    if [[ $has_skills -eq 0 && $has_hooks -eq 0 ]]; then
-        _error "Package '$pkg_name' has neither skills/ nor hooks/ directory."
-        _hint "A package should contain skills/ and/or hooks/."
+    if [[ $has_skills -eq 0 && $has_hooks -eq 0 && $has_context -eq 0 ]]; then
+        _error "Package '$pkg_name' has no skills/, hooks/, or agent-context.md."
+        _hint "A package should contain skills/, hooks/, and/or agent-context.md."
         exit 1
     fi
 
@@ -88,25 +90,26 @@ cmd_install_package() {
         done
     fi
 
-    # --- Store hooks ---
+    # --- Store hooks and agent-context ---
     local hook_count=0
-    if [[ $has_hooks -eq 1 ]]; then
+    if [[ $has_hooks -eq 1 || $has_context -eq 1 ]]; then
         local hooks_store="$env_dir/.hooks/$pkg_name"
         rm -rf "$hooks_store"
         mkdir -p "$hooks_store"
 
-        if [[ $link_mode -eq 1 ]]; then
-            # Symlink the hooks dir contents
-            for item in "$pkg_path"/hooks/*; do
-                [[ -e "$item" ]] || continue
-                ln -sf "$item" "$hooks_store/$(basename "$item")"
-            done
-        else
-            cp -r "$pkg_path"/hooks/* "$hooks_store/"
-        fi
+        # Store hooks
+        if [[ $has_hooks -eq 1 ]]; then
+            if [[ $link_mode -eq 1 ]]; then
+                for item in "$pkg_path"/hooks/*; do
+                    [[ -e "$item" ]] || continue
+                    ln -sf "$item" "$hooks_store/$(basename "$item")"
+                done
+            else
+                cp -r "$pkg_path"/hooks/* "$hooks_store/"
+            fi
 
-        # Count hook events
-        hook_count=$(python3 -c "
+            # Count hook events
+            hook_count=$(python3 -c "
 import json, glob, sys
 count = 0
 for f in glob.glob('$hooks_store/*.json'):
@@ -118,6 +121,16 @@ for f in glob.glob('$hooks_store/*.json'):
     except: pass
 print(count)
 " 2>/dev/null || echo "0")
+        fi
+
+        # Store agent-context.md
+        if [[ $has_context -eq 1 ]]; then
+            if [[ $link_mode -eq 1 ]]; then
+                ln -sf "$pkg_path/agent-context.md" "$hooks_store/agent-context.md"
+            else
+                cp "$pkg_path/agent-context.md" "$hooks_store/agent-context.md"
+            fi
+        fi
 
         # Store package metadata
         cat > "$hooks_store/.package-meta" <<EOF
@@ -134,6 +147,10 @@ EOF
         [[ -n "$parts" ]] && parts="$parts, "
         parts="${parts}$hook_count hook(s)"
     fi
+    if [[ $has_context -eq 1 ]]; then
+        [[ -n "$parts" ]] && parts="$parts, "
+        parts="${parts}agent-context"
+    fi
 
     _info "Installed package ${BOLD}$pkg_name${NC} into ${BOLD}$env_name${NC} ($parts)"
 
@@ -147,8 +164,8 @@ EOF
         _hint "Active environment updated."
     fi
 
-    if [[ $hook_count -gt 0 ]]; then
-        _hint "Run 'skenv hooks apply' in your project to activate hooks."
+    if [[ $hook_count -gt 0 || $has_context -eq 1 ]]; then
+        _hint "Run 'skenv hooks apply' in your project to activate hooks and context."
     fi
 }
 
@@ -242,6 +259,9 @@ _hooks_apply_package() {
         copilot) _hooks_apply_copilot "$pkg_name" "$pkg_dir" "$project_dir" ;;
         claude)  _hooks_apply_claude "$pkg_name" "$pkg_dir" "$project_dir" ;;
     esac
+
+    # Apply agent context if present
+    _context_apply "$pkg_name" "$pkg_dir" "$project_dir" "$platform"
 }
 
 _hooks_apply_copilot() {
@@ -575,6 +595,9 @@ PYEOF
     fi
 
     _info "Removed ${BOLD}$pkg_name${NC} hooks from $project_dir"
+
+    # Remove agent context
+    _context_remove "$pkg_name" "$project_dir" "copilot"
 }
 
 _hooks_remove_claude() {
@@ -612,6 +635,130 @@ with open(target_file, 'w') as f:
 PYEOF
 
     _info "Removed ${BOLD}$pkg_name${NC} hooks from $target_file"
+
+    # Remove agent context
+    _context_remove "$pkg_name" "$project_dir" "claude"
+}
+#
+# Injects/removes agent-context.md content into project instruction files.
+# Copilot: .github/copilot-instructions.md
+# Claude:  claude.md (preferred) or AGENTS.md
+
+_detect_instructions_file() {
+    local project_dir="$1"
+    local platform="$2"
+
+    case "$platform" in
+        copilot)
+            echo "$project_dir/.github/copilot-instructions.md"
+            ;;
+        claude)
+            if [[ -f "$project_dir/claude.md" ]]; then
+                echo "$project_dir/claude.md"
+            elif [[ -f "$project_dir/AGENTS.md" ]]; then
+                echo "$project_dir/AGENTS.md"
+            else
+                echo "$project_dir/claude.md"
+            fi
+            ;;
+    esac
+}
+
+_context_apply() {
+    local pkg_name="$1"
+    local pkg_dir="$2"
+    local project_dir="$3"
+    local platform="$4"
+
+    # Find agent-context.md (resolve symlinks)
+    local context_file="$pkg_dir/agent-context.md"
+    if [[ -L "$context_file" ]]; then
+        context_file=$(realpath "$context_file" 2>/dev/null || echo "$context_file")
+    fi
+    [[ -f "$context_file" ]] || return 0
+
+    local instructions_file
+    instructions_file=$(_detect_instructions_file "$project_dir" "$platform")
+
+    # Ensure parent directory exists
+    mkdir -p "$(dirname "$instructions_file")"
+
+    # Read the context content
+    local context_content
+    context_content=$(cat "$context_file")
+
+    local marker_start="<!-- skenv:${pkg_name} -->"
+    local marker_end="<!-- /skenv:${pkg_name} -->"
+
+    if [[ -f "$instructions_file" ]]; then
+        # Remove existing block if present (idempotent re-apply)
+        local tmp_file
+        tmp_file=$(mktemp)
+        python3 -c "
+import sys
+marker_start = '$marker_start'
+marker_end = '$marker_end'
+with open('$instructions_file') as f:
+    content = f.read()
+# Remove existing block (including markers and surrounding blank lines)
+import re
+pattern = r'\n*' + re.escape(marker_start) + r'.*?' + re.escape(marker_end) + r'\n*'
+content = re.sub(pattern, '\n', content, flags=re.DOTALL)
+content = content.strip()
+with open('$tmp_file', 'w') as f:
+    f.write(content)
+    f.write('\n')
+" 2>/dev/null
+        mv "$tmp_file" "$instructions_file"
+    fi
+
+    # Append the marked block
+    {
+        [[ -f "$instructions_file" && -s "$instructions_file" ]] && echo ""
+        echo "$marker_start"
+        echo "$context_content"
+        echo "$marker_end"
+    } >> "$instructions_file"
+
+    _info "Injected ${BOLD}$pkg_name${NC} context into $(basename "$instructions_file")"
+}
+
+_context_remove() {
+    local pkg_name="$1"
+    local project_dir="$2"
+    local platform="$3"
+
+    local instructions_file
+    instructions_file=$(_detect_instructions_file "$project_dir" "$platform")
+
+    [[ -f "$instructions_file" ]] || return 0
+
+    local marker_start="<!-- skenv:${pkg_name} -->"
+    local marker_end="<!-- /skenv:${pkg_name} -->"
+
+    # Check if markers exist
+    if ! grep -qF "$marker_start" "$instructions_file" 2>/dev/null; then
+        return 0
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp)
+    python3 -c "
+import re
+marker_start = '$marker_start'
+marker_end = '$marker_end'
+with open('$instructions_file') as f:
+    content = f.read()
+pattern = r'\n*' + re.escape(marker_start) + r'.*?' + re.escape(marker_end) + r'\n*'
+content = re.sub(pattern, '\n', content, flags=re.DOTALL)
+content = content.strip()
+with open('$tmp_file', 'w') as f:
+    f.write(content)
+    f.write('\n')
+" 2>/dev/null
+    mv "$tmp_file" "$instructions_file"
+
+    _info "Removed ${BOLD}$pkg_name${NC} context from $(basename "$instructions_file")"
 }
 
 # --- Hooks list ---
@@ -671,6 +818,9 @@ print(', '.join(sorted(events)) if events else 'none')
 
         echo -e "  ${BLUE}•${NC} ${BOLD}$pkg_name${NC}"
         echo -e "    Events: ${CYAN}$events${NC}"
+        if [[ -f "$pkg_dir/agent-context.md" ]] || [[ -L "$pkg_dir/agent-context.md" ]]; then
+            echo -e "    Context: ${GREEN}agent-context.md${NC}"
+        fi
         [[ -n "$source" ]] && echo -e "    Source: ${YELLOW}$source${NC}"
     done
 

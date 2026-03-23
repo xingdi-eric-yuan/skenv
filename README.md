@@ -151,15 +151,15 @@ You can have one claude env and one copilot env active simultaneously. The platf
 | `install <path> [--env N] [--link]` | Add a skill (copy or symlink) |
 | `uninstall <name> [--env N]` | Remove a skill |
 | `ls [name]` | List skills in environment |
-| `install-package <path> [--env N] [--link]` | Install skill package (skills + hooks) |
+| `install-package <path> [--env N] [--link]` | Install skill package (skills + hooks + context) |
 
-### Hooks
+### Hooks & Context
 
 | Command | Description |
 |---------|-------------|
-| `hooks apply [pkg] [--project <dir>]` | Apply hooks to a project |
-| `hooks remove <pkg> [--project <dir>]` | Remove hooks from a project |
-| `hooks list [--env <name>]` | List installed hook packages |
+| `hooks apply [pkg] [--project <dir>]` | Apply hooks + agent context to a project |
+| `hooks remove <pkg> [--project <dir>]` | Remove hooks + agent context from a project |
+| `hooks list [--env <name>]` | List installed packages (hooks, context) |
 
 ### Base Layer
 
@@ -185,19 +185,26 @@ You can have one claude env and one copilot env active simultaneously. The platf
 
 **Linked vs copied:** `--link` symlinks to source (stays in sync, good for development). Default copies (self-contained). `skenv ls` shows `(linked)` and `(outdated)` indicators.
 
-**Packages:** A directory with `skills/` and optionally `hooks/`. One command installs everything:
+**Packages:** A directory with `skills/`, optionally `hooks/`, and optionally `agent-context.md`:
+
+```
+MyPackage/
+├── skills/              # skill definitions (installed into env)
+├── hooks/               # lifecycle hooks (applied per-project)
+└── agent-context.md     # always-on context (injected into project instructions)
+```
 
 ```bash
 skenv install-package ~/ShadowFrog --link
 ```
 
-**Hooks:** Skills are user-global; hooks are project-scoped. Apply them per-project:
+**Hooks & agent context:** Skills are user-global; hooks and agent context are project-scoped. Apply them per-project:
 
 ```bash
 cd ~/projects/my-app && skenv hooks apply
 ```
 
-Hooks merge into the project's config (`.github/hooks/hooks.json` for Copilot, `.claude/settings.json` for Claude). Multiple packages coexist; each is tagged for clean removal.
+Hooks merge into the project's config (`.github/hooks/hooks.json` for Copilot, `.claude/settings.json` for Claude). Agent context is injected into the project's instructions file (`.github/copilot-instructions.md` or `claude.md`) wrapped in markers for clean removal. Multiple packages coexist; each is tagged for clean removal.
 
 **Inheritance:** `skenv inherit child parent` — child sees parent's skills plus its own.
 
