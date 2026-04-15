@@ -230,15 +230,22 @@ _install_package_to_project() {
     if [[ $has_hooks -eq 1 ]]; then
         local target_hooks="$project_dir/.github/hooks"
         local target_scripts="$target_hooks/scripts"
+
+        # Replace symlinks left from prior personal-style installs
+        [[ -L "$target_scripts" ]] && rm "$target_scripts"
+        [[ -L "$target_hooks/hooks.json" ]] && rm "$target_hooks/hooks.json"
+
         mkdir -p "$target_hooks"
         mkdir -p "$target_scripts"
 
-        # Copy hook scripts
+        # Copy hook scripts (replace any symlinks from prior hooks apply)
         if [[ -d "$pkg_path/hooks/scripts" ]]; then
             for script in "$pkg_path"/hooks/scripts/*; do
                 [[ -f "$script" ]] || continue
-                cp "$script" "$target_scripts/$(basename "$script")"
-                chmod +x "$target_scripts/$(basename "$script")"
+                local dest="$target_scripts/$(basename "$script")"
+                [[ -L "$dest" ]] && rm "$dest"
+                cp "$script" "$dest"
+                chmod +x "$dest"
             done
         fi
 
