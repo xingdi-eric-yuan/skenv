@@ -15,7 +15,7 @@ COMMANDS:
   deactivate [--claude|--copilot]  Deactivate env(s) (no flag = deactivate all)
   install <path> [opts]        Install a skill (--env N, --link)
   install-package <path> [opts]  Install a skill package (skills + hooks + context)
-                                 --project <dir> to install to .github/skills/ for cloud agent
+                                 --project <dir> to copy into .github/ for cloud agent
   uninstall <name> [opts]      Remove a skill (--env N)
   list                         List all environments (* = active, shows platform)
   ls [name]                    List skills in an environment (default: active)
@@ -68,7 +68,7 @@ EXAMPLES:
   skenv hooks list                           # show installed hook packages
   skenv hooks remove ShadowFrog              # remove hooks + context from project
 
-  skenv install-package ~/ShadowFrog --project .  # copy skills to .github/skills/
+  skenv install-package ~/ShadowFrog --project .  # copy skills+hooks to .github/
                                                   # for cloud agent / delegate support
 
   skenv freeze > research.manifest        # export (includes platform)

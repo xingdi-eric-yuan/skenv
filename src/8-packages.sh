@@ -181,8 +181,9 @@ EOF
 
 # --- Project-level package installation ---
 #
-# Copies skills to .github/skills/ for cloud agent / delegate support.
-# Also injects agent-context.md into .github/copilot-instructions.md.
+# Copies skills to .github/skills/ for cloud agent, hooks to .github/hooks/ for
+# local CLI sessions, and agent-context to .github/copilot-instructions.md.
+# One command sets up everything — no separate `hooks apply` needed.
 
 _install_package_to_project() {
     local pkg_path="$1"
@@ -198,44 +199,135 @@ _install_package_to_project() {
     local pkg_name
     pkg_name=$(basename "$pkg_path")
 
-    local has_skills=0 has_context=0
+    local has_skills=0 has_hooks=0 has_context=0
     [[ -d "$pkg_path/skills" ]] && has_skills=1
+    [[ -d "$pkg_path/hooks" ]] && has_hooks=1
     [[ -f "$pkg_path/agent-context.md" ]] && has_context=1
 
-    if [[ $has_skills -eq 0 && $has_context -eq 0 ]]; then
-        _error "Package '$pkg_name' has no skills/ or agent-context.md to install to project."
+    if [[ $has_skills -eq 0 && $has_hooks -eq 0 && $has_context -eq 0 ]]; then
+        _error "Package '$pkg_name' has no skills/, hooks/, or agent-context.md."
         exit 1
     fi
 
-    local target_skills="$project_dir/.github/skills"
+    # --- Copy skills to .github/skills/ ---
     local skill_count=0
-
     if [[ $has_skills -eq 1 ]]; then
+        local target_skills="$project_dir/.github/skills"
         mkdir -p "$target_skills"
         for skill_dir in "$pkg_path"/skills/*/; do
             [[ -d "$skill_dir" ]] || continue
             local skill_name
             skill_name=$(basename "$skill_dir")
             local dest="$target_skills/$skill_name"
-
-            # Always copy (not symlink) for project installs
             rm -rf "$dest"
             cp -r "$skill_dir" "$dest"
             skill_count=$((skill_count + 1))
         done
     fi
 
-    # Inject agent-context into .github/copilot-instructions.md
+    # --- Copy hooks to .github/hooks/ ---
+    local hook_count=0
+    if [[ $has_hooks -eq 1 ]]; then
+        local target_hooks="$project_dir/.github/hooks"
+        local target_scripts="$target_hooks/scripts"
+        mkdir -p "$target_hooks"
+        mkdir -p "$target_scripts"
+
+        # Copy hook scripts
+        if [[ -d "$pkg_path/hooks/scripts" ]]; then
+            for script in "$pkg_path"/hooks/scripts/*; do
+                [[ -f "$script" ]] || continue
+                cp "$script" "$target_scripts/$(basename "$script")"
+                chmod +x "$target_scripts/$(basename "$script")"
+            done
+        fi
+
+        # Merge hook JSON configs into hooks.json (reuse copilot merge logic)
+        local hook_files=()
+        for f in "$pkg_path"/hooks/*.json; do
+            [[ -f "$f" ]] || continue
+            hook_files+=("$f")
+        done
+
+        if [[ ${#hook_files[@]} -gt 0 ]]; then
+            python3 << PYEOF
+import json, sys, os
+
+target_file = "$target_hooks/hooks.json"
+pkg_name = "$pkg_name"
+hook_files = ${hook_files[@]+"$(printf '"%s",' "${hook_files[@]}" | sed 's/,$//')"}
+
+if isinstance(hook_files, str):
+    hook_files = [hook_files]
+
+existing = {"version": 1, "hooks": {}}
+if os.path.exists(target_file):
+    try:
+        with open(target_file) as f:
+            existing = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        pass
+
+# Remove old entries from this package
+for event in list(existing.get("hooks", {}).keys()):
+    existing["hooks"][event] = [
+        e for e in existing["hooks"][event]
+        if e.get("_skenv_package") != pkg_name
+    ]
+    if not existing["hooks"][event]:
+        del existing["hooks"][event]
+
+# Add new entries
+for hf in hook_files:
+    try:
+        with open(hf) as f:
+            pkg_hooks = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        continue
+    for event, entries in pkg_hooks.get("hooks", {}).items():
+        if event not in existing.get("hooks", {}):
+            existing.setdefault("hooks", {})[event] = []
+        for entry in entries:
+            entry["_skenv_package"] = pkg_name
+            existing["hooks"][event].append(entry)
+
+existing.setdefault("version", 1)
+
+with open(target_file, 'w') as f:
+    json.dump(existing, f, indent=2)
+    f.write('\n')
+
+count = sum(len(entries) for entries in existing.get("hooks", {}).values()
+            if any(e.get("_skenv_package") == pkg_name for e in entries))
+print(count)
+PYEOF
+            hook_count=$?
+            # Read the printed count
+            hook_count=$(python3 -c "
+import json
+with open('$target_hooks/hooks.json') as f:
+    data = json.load(f)
+print(sum(1 for e, entries in data.get('hooks', {}).items()
+          for entry in entries if entry.get('_skenv_package') == '$pkg_name'))
+" 2>/dev/null || echo "0")
+        fi
+    fi
+
+    # --- Inject agent-context ---
     if [[ $has_context -eq 1 ]]; then
         _context_apply "$pkg_name" "$pkg_path" "$project_dir" "copilot"
     fi
 
-    # Report
+    # --- Report ---
     local parts=""
-    [[ $skill_count -gt 0 ]] && parts="$skill_count skill(s) → .github/skills/"
+    [[ $skill_count -gt 0 ]] && parts="$skill_count skill(s)"
+    if [[ $hook_count -gt 0 ]]; then
+        [[ -n "$parts" ]] && parts="$parts, "
+        parts="${parts}$hook_count hook(s)"
+    fi
     if [[ $has_context -eq 1 ]]; then
         [[ -n "$parts" ]] && parts="$parts, "
-        parts="${parts}agent-context → copilot-instructions.md"
+        parts="${parts}agent-context"
     fi
 
     _info "Installed ${BOLD}$pkg_name${NC} to project ${BOLD}$project_dir${NC} ($parts)"
