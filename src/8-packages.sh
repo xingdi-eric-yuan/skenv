@@ -12,12 +12,16 @@ cmd_install_package() {
     local pkg_path=""
     local env_name=""
     local link_mode=0
+    local project_dir=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --env)
                 [[ $# -lt 2 ]] && { _error "--env requires an environment name"; exit 1; }
                 env_name="$2"; shift 2 ;;
+            --project)
+                [[ $# -lt 2 ]] && { _error "--project requires a directory"; exit 1; }
+                project_dir="$2"; shift 2 ;;
             --link) link_mode=1; shift ;;
             -*)  _error "Unknown flag: $1"; exit 1 ;;
             *)
@@ -31,7 +35,7 @@ cmd_install_package() {
     done
 
     if [[ -z "$pkg_path" ]]; then
-        _error "Usage: skenv install-package <path> [--env <name>] [--link]"
+        _error "Usage: skenv install-package <path> [--env <name>] [--link] [--project <dir>]"
         exit 1
     fi
 
@@ -40,6 +44,12 @@ cmd_install_package() {
     if [[ ! -d "$pkg_path" ]]; then
         _error "Package path '$pkg_path' is not a directory."
         exit 1
+    fi
+
+    # --- Project mode: copy skills + context to .github/skills/ ---
+    if [[ -n "$project_dir" ]]; then
+        _install_package_to_project "$pkg_path" "$project_dir"
+        return
     fi
 
     local pkg_name
@@ -167,6 +177,69 @@ EOF
     if [[ $hook_count -gt 0 || $has_context -eq 1 ]]; then
         _hint "Run 'skenv hooks apply' in your project to activate hooks and context."
     fi
+}
+
+# --- Project-level package installation ---
+#
+# Copies skills to .github/skills/ for cloud agent / delegate support.
+# Also injects agent-context.md into .github/copilot-instructions.md.
+
+_install_package_to_project() {
+    local pkg_path="$1"
+    local project_dir="$2"
+
+    project_dir=$(realpath "$project_dir" 2>/dev/null || echo "$project_dir")
+
+    if [[ ! -d "$project_dir" ]]; then
+        _error "Project directory '$project_dir' does not exist."
+        exit 1
+    fi
+
+    local pkg_name
+    pkg_name=$(basename "$pkg_path")
+
+    local has_skills=0 has_context=0
+    [[ -d "$pkg_path/skills" ]] && has_skills=1
+    [[ -f "$pkg_path/agent-context.md" ]] && has_context=1
+
+    if [[ $has_skills -eq 0 && $has_context -eq 0 ]]; then
+        _error "Package '$pkg_name' has no skills/ or agent-context.md to install to project."
+        exit 1
+    fi
+
+    local target_skills="$project_dir/.github/skills"
+    local skill_count=0
+
+    if [[ $has_skills -eq 1 ]]; then
+        mkdir -p "$target_skills"
+        for skill_dir in "$pkg_path"/skills/*/; do
+            [[ -d "$skill_dir" ]] || continue
+            local skill_name
+            skill_name=$(basename "$skill_dir")
+            local dest="$target_skills/$skill_name"
+
+            # Always copy (not symlink) for project installs
+            rm -rf "$dest"
+            cp -r "$skill_dir" "$dest"
+            skill_count=$((skill_count + 1))
+        done
+    fi
+
+    # Inject agent-context into .github/copilot-instructions.md
+    if [[ $has_context -eq 1 ]]; then
+        _context_apply "$pkg_name" "$pkg_path" "$project_dir" "copilot"
+    fi
+
+    # Report
+    local parts=""
+    [[ $skill_count -gt 0 ]] && parts="$skill_count skill(s) → .github/skills/"
+    if [[ $has_context -eq 1 ]]; then
+        [[ -n "$parts" ]] && parts="$parts, "
+        parts="${parts}agent-context → copilot-instructions.md"
+    fi
+
+    _info "Installed ${BOLD}$pkg_name${NC} to project ${BOLD}$project_dir${NC} ($parts)"
+    _hint "Commit and push .github/ so the cloud agent can find them."
 }
 
 # --- Hooks management ---

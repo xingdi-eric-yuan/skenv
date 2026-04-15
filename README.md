@@ -152,6 +152,7 @@ You can have one claude env and one copilot env active simultaneously. The platf
 | `uninstall <name> [--env N]` | Remove a skill |
 | `ls [name]` | List skills in environment |
 | `install-package <path> [--env N] [--link]` | Install skill package (skills + hooks + context) |
+| `install-package <path> --project <dir>` | Copy skills to `.github/skills/` for cloud agent |
 
 ### Hooks & Context
 
@@ -197,6 +198,15 @@ MyPackage/
 ```bash
 skenv install-package ~/ShadowFrog --link
 ```
+
+**Project installs (cloud agent / delegate):** The Copilot cloud agent only sees `.github/skills/`, not personal skills. Use `--project` to copy skills there:
+
+```bash
+skenv install-package ~/ShadowFrog --project ~/my-app
+cd ~/my-app && git add .github/ && git commit -m "Add ShadowFrog for cloud agent"
+```
+
+This copies skills to `.github/skills/` and injects agent-context into `.github/copilot-instructions.md`. No symlinks — files are committed and pushed so the cloud agent can find them.
 
 **Hooks & agent context:** Skills are user-global; hooks and agent context are project-scoped. Apply them per-project:
 
